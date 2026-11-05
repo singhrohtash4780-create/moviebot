@@ -272,6 +272,16 @@ def touch_meta():
     # App har kuch minute mein sirf yahi chhoti value padhta hai; badli ho tabhi poori list laata hai
     db.reference("meta").update({"updated": int(time.time() * 1000)})
 
+# Quality ka darja (bada = behtar). Naya poster behtar quality ka aaye to purana card upgrade hota hai
+QUAL_RANK = {"cam": 1, "hdcam": 1, "hdts": 2, "hdtc": 2, "hdrip": 3, "dvdrip": 3, "webrip": 4, "webdl": 5, "bluray": 6}
+QUAL_RE = re.compile(r"WEB-?DL|WEB-?Rip|Blu-?Ray|HDRip|DVD-?Rip|HDTC|HDTS|HDCAM|CAM", re.I)
+# True ho (env KEEP_OLD_FILES=1) to upgrade par purani files bhi card mein rehti hain; warna sirf nayi quality ki files
+KEEP_OLD_FILES = os.environ.get("KEEP_OLD_FILES", "").strip().lower() in ("1", "yes", "true")
+
+def quality_rank(q):
+    ranks = [QUAL_RANK.get(re.sub(r"[^a-z]", "", m.group(0).lower()), 0) for m in QUAL_RE.finditer(q or "")]
+    return max(ranks) if ranks else 0
+
 def is_duplicate_file(target, msg_id, uid, fname, size):
     """Ye file (ya uski copy/forward) is movie mein pehle se judi hai?  file_unique_id forward/repost par bhi wahi rehta hai."""
     files = db.reference(f"movies/{target}/files").get() or {}
@@ -368,6 +378,20 @@ async def on_channel_post(update, context):
             if same:
                 tgt = same[0]
                 added = 0
+                upgraded = False
+                new_r = quality_rank(d.get("quality", ""))
+                old_q = db.reference(f"movies/{tgt}/quality").get() or ""
+                if new_r and quality_rank(old_q) and new_r > quality_rank(old_q):   # dono ka tag pata ho tabhi      # behtar quality ka poster aaya: purane card ko upgrade karo
+                    upd = {"quality": d.get("quality", ""), "link": base + str(msg.message_id), "date": msg.date.isoformat()}
+                    for fld in ("language", "format", "alias"):
+                        if d.get(fld):
+                            upd[fld] = d[fld]
+                    movies.child(str(tgt)).update(upd)
+                    if not KEEP_OLD_FILES:
+                        movies.child(str(tgt)).child("files").delete()     # purani (kam quality) files app se hatao, channel mein rehti hain
+                    db.reference("posters").child(str(tgt)).set(poster)
+                    index_set(tgt, {"title": db.reference(f"movies/{tgt}/title").get() or title, "quality": upd["quality"], "date": upd["date"]})
+                    upgraded = True
                 if btns:     # card pehle se hai par buttons nahi judi thi: ab jod do (naye card ki jagah)
                     ex = db.reference(f"movies/{tgt}/files").get() or {}
                     have = {(f.get("label"), f.get("link")) for f in (ex.values() if isinstance(ex, dict) else ex) if f}
@@ -377,7 +401,10 @@ async def on_channel_post(update, context):
                         movies.child(str(tgt)).child("files").child(f"{msg.message_id}_{i}").set(
                             {"label": text, "season": 0, "link": url, "size": ""})
                         added += 1
-                if added:
+                if upgraded:
+                    touch_meta()
+                    print("Card upgrade hui:", title, "|", old_q, "->", d.get("quality", ""), "| purani files", "rakhi" if KEEP_OLD_FILES else "hata di")
+                elif added:
                     touch_meta()
                     print("Card pehle se thi, ab buttons jod diye:", title, "| buttons:", added)
                 else:
