@@ -4,6 +4,7 @@ import os, io, re, json, uuid, socket, base64, asyncio, time, threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import firebase_admin
 from firebase_admin import credentials, db
+from telegram import BotCommand, BotCommandScopeChat
 from telegram.ext import Application, MessageHandler, CommandHandler, filters
 from PIL import Image, ImageFilter, ImageOps
 from telegram.error import RetryAfter
@@ -593,6 +594,7 @@ async def on_help(update, context):
         return
     await update.message.reply_text(
         "Admin commands (bot ko private chat mein bhejo):\n\n"
+        "/start - bot shuru karo\n"
         "/myid - apna Telegram ID dekho\n"
         "/settitle Naya Naam - app ka naam badlo\n"
         "/setlogo - photo bhejo, caption mein /setlogo likho (app ka logo)\n"
@@ -642,7 +644,7 @@ def app_remove(ids):
     """Ye post(s) app (Firebase) se hatao. (card, file, card ke naam) lautata hai."""
     global NAMES
     data = db.reference("movies").get() or {}
-    items = {str(k): v for k, v in (data.items() if isinstance(data, dict) else enumerate(data))}
+    items = {str(k): v for k, v in (data.items() if isinstance(data, dict) else enumerate(data)) if v}   # list aaye to khali (None) jagah chhod do
     cards, files_n, titles = 0, 0, []
     for pid in ids:
         if pid in items:                                   # poster post: poori movie hatao
@@ -750,6 +752,11 @@ async def on_error(update, context):
     # Network ki chhoti dikkat (Telegram tak nahi pahunch paya) par lambi traceback ki jagah ek line likho
     err = context.error
     print("Error:", type(err).__name__, str(err)[:150])
+    try:      # admin ko chat mein bhi dikhao, taaki command chup na lage
+        if update and getattr(update, "message", None) and update.effective_user and update.effective_user.id == ADMIN_ID:
+            await update.message.reply_text("Error: " + type(err).__name__ + " - " + str(err)[:200])
+    except Exception:
+        pass
 
 async def post_init(application):
     me = await application.bot.get_me()
@@ -757,6 +764,25 @@ async def post_init(application):
     if db.reference("meta/updated").get() is None:
         touch_meta()                                       # app ko pehli value mil jaye
     print("Bot chalu:", me.username)
+    # Telegram ke "/" menu mein commands dikhao: sab ko sirf /start, admin ko poori list
+    try:
+        await application.bot.set_my_commands([BotCommand("start", "Bot shuru karo")])
+        if ADMIN_ID:
+            await application.bot.set_my_commands([
+                BotCommand("help", "Saari admin commands ki list"),
+                BotCommand("myid", "Apna Telegram ID dekho"),
+                BotCommand("settitle", "App ka naam badlo"),
+                BotCommand("setlogo", "App ka logo badlo (photo ke saath)"),
+                BotCommand("setlink", "Request/Help/Channel button ka link"),
+                BotCommand("remove", "Sirf app se hatao (post link)"),
+                BotCommand("delete", "App, channel aur backup teeno se hatao"),
+                BotCommand("merge", "Bina-poster faltu cards milao"),
+                BotCommand("alias", "Doosre naam ki files card mein lao"),
+                BotCommand("rebuildindex", "App ka index dobara banao"),
+                BotCommand("start", "Bot shuru karo"),
+            ], scope=BotCommandScopeChat(chat_id=ADMIN_ID))
+    except Exception as e:
+        print("Command menu set nahi hua:", type(e).__name__, str(e)[:100])
     try:
         n = merge_autos()
         if n:
