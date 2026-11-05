@@ -658,7 +658,7 @@ async def on_help(update, context):
         "/merge - bina-poster wale faltu cards ko poster wale card mein milao\n"
         "/alias POSTER_LINK Naam - doosre naam ki files bhi us card mein lao (jaise Jannat 2)\n"
         "/setq FILE_POST_LINK 480p - file ki quality haath se set karo (label \"Watch\" ho to)\n"
-        "/setname FILE_POST_LINK Naya.Naam.mkv - file ka naam badlo (bot ye naam bhejta hai)\n"
+        "/setname LINK Naya.Naam.mkv - file ka naam badlo (kai file: har line mein LINK aur naam)\n"
         "/rebuildindex - app ke liye halka index banao (purani movies ke liye ek baar)\n"
         "/help - ye list\n\n"
         "Auto tareeka: poster ke caption mein ek line likho  Also: Jannat 2, Jannat 3  to un naamo ki files apne aap us card mein aayengi.")
@@ -702,47 +702,56 @@ async def on_setq(update, context):
     await update.message.reply_text(msg + ("\nApp mein 3 minute ke andar badal jayega." if done else ""))
 
 async def on_setname(update, context):
-    # /setname FILE_POST_LINK Naya.File.Naam.mkv -> file ka naam badlo (bot ye naam caption mein bhejta hai; backup copy ka caption bhi badalta hai)
+    # /setname LINK Naya.Naam.mkv   (ek file)   ya   kai file: har line mein  LINK  naam
     if not await admin_ok(update):
         return
-    parts = (update.message.text or "").split(None, 2)
-    mid = re.search(r"(\d+)\s*$", parts[1]) if len(parts) >= 2 else None
-    if not mid or len(parts) < 3 or not parts[2].strip():
-        await update.message.reply_text("Aise likho (file wali post ka link, phir naya naam):\n"
-                                        "/setname https://t.me/tumhara_channel/2720 Dhoondte.Reh.Jaaoge.2009.480p.WEB-DL.mkv")
-        return
-    pid, new = mid.group(1), parts[2].strip()
-    if re.search(r"https?://|t\.me/", new) or "\n" in new or len(new) > 200:
-        await update.message.reply_text("Naam mein link ya kai line nahi chalegi. Ek command mein ek hi file ka sirf naya naam likho:\n"
-                                        "/setname https://t.me/tumhara_channel/2720 Naya.Naam.mkv")
+    lines = (update.message.text or "").splitlines()
+    first = re.sub(r"^/setname(@\w+)?[ \t]*", "", lines[0] if lines else "")
+    entries = [e.strip() for e in [first] + lines[1:] if e.strip()]
+    jobs, bad = [], []
+    for e in entries:
+        parts = e.split(None, 1)
+        mid = re.search(r"(\d+)\s*$", parts[0]) if parts else None
+        name = parts[1].strip() if len(parts) == 2 else ""
+        if not mid or not name or re.search(r"https?://|t\.me/", name) or len(name) > 200:
+            bad.append(e[:60])
+        else:
+            jobs.append((mid.group(1), name))
+    if not jobs:
+        await update.message.reply_text("Aise likho (har line mein file wali post ka link, phir naya naam):\n"
+                                        "/setname\n"
+                                        "https://t.me/tumhara_channel/2720 Dhoondte.Reh.Jaaoge.2009.480p.mkv\n"
+                                        "https://t.me/tumhara_channel/2721 Dhoondte.Reh.Jaaoge.2009.720p.mkv"
+                                        + ("\n\nYe line samajh nahi aayi: " + "; ".join(bad) if bad else ""))
         return
     data = db.reference("movies").get() or {}
     items = {str(k): v for k, v in (data.items() if isinstance(data, dict) else enumerate(data)) if v}
-    hit = next((k for k, v in items.items() if pid in (v.get("files") or {})), None)
-    if not hit:
-        await update.message.reply_text("Ye post app mein file ki tarah nahi mili: " + pid)
-        return
-    old = str((items[hit]["files"][pid] or {}).get("file", ""))
-    db.reference(f"movies/{hit}/files/{pid}/file").set(new)
-    touch_meta()
-    bmap = db.reference(f"backup/{pid}").get() or {}
-    bok = bfail = 0
-    for cid, copy_id in (bmap.items() if isinstance(bmap, dict) else []):
-        try:
-            await context.bot.edit_message_caption(chat_id=int(cid), message_id=int(copy_id), caption=new[:1024])
-            bok += 1
-        except Exception as e:
-            if "not modified" in str(e).lower():
+    out = []
+    for pid, new in jobs:
+        hit = next((k for k, v in items.items() if pid in (v.get("files") or {})), None)
+        if not hit:
+            out.append(f"{pid}: app mein file ki tarah nahi mili")
+            continue
+        db.reference(f"movies/{hit}/files/{pid}/file").set(new)
+        bmap = db.reference(f"backup/{pid}").get() or {}
+        bok = bfail = 0
+        for cid, copy_id in (bmap.items() if isinstance(bmap, dict) else []):
+            try:
+                await context.bot.edit_message_caption(chat_id=int(cid), message_id=int(copy_id), caption=new[:1024])
                 bok += 1
-            else:
-                bfail += 1
-                print("Backup caption nahi badla:", cid, copy_id, type(e).__name__, str(e)[:100])
-        await asyncio.sleep(0.5)
-    msg = f"File ka naam badal diya:\nPehle: {old or '(khali)'}\nAb: {new}"
-    if bmap:
-        msg += f"\nBackup: {bok} jagah badla" + (f", {bfail} jagah nahi badla" if bfail else "") + "."
-    else:
-        msg += "\nBackup: is file ki koi backup copy nahi mili."
+            except Exception as e:
+                if "not modified" in str(e).lower():
+                    bok += 1
+                else:
+                    bfail += 1
+                    print("Backup caption nahi badla:", cid, copy_id, type(e).__name__, str(e)[:100])
+            await asyncio.sleep(0.5)
+        bk = f" | backup {bok} jagah" + (f", {bfail} nahi" if bfail else "") if bmap else " | backup copy nahi mili"
+        out.append(f"{pid}: {new}{bk}")
+    touch_meta()
+    msg = "File ka naam badal diya:\n" + "\n".join(out)
+    if bad:
+        msg += "\n\nYe line samajh nahi aayi: " + "; ".join(bad)
     await update.message.reply_text(msg)
 
 async def on_rebuildindex(update, context):
