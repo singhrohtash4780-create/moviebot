@@ -105,16 +105,22 @@ def base_key(k):
     k = re.sub(r"\bpart \d+(?: \d+)*\b", " ", k or "")
     return re.sub(r"\s+", " ", k).strip()
 
-NAMES = None   # poster_post_id -> (naam_key, season)
+NAMES = None
+YEARS = {}      # card id -> saal (title ke (2002) se): same naam ki alag saal wali movies/series alag rahein   # poster_post_id -> (naam_key, season)
 AUTO = set()   # bina-poster wale card (file se bane) ke ID
 ALIASES = {}   # poster_post_id -> [doosre naam ki keys] (jaise "jannat 2" bhi is card mein aaye)
 
+def card_year(title):
+    m = re.search(r"\(((?:19|20)\d{2})\)", title or "")
+    return m.group(1) if m else ""
+
 def load_names():
-    global NAMES, AUTO, ALIASES
+    global NAMES, AUTO, ALIASES, YEARS
     data = db.reference("movies").get() or {}
     items = data.items() if isinstance(data, dict) else enumerate(data)
     items = [(k, v) for k, v in items if v and v.get("title")]
     NAMES = {int(k): (title_key(v.get("title")), v.get("season", 0) or 0) for k, v in items}
+    YEARS = {int(k): card_year(v.get("title")) for k, v in items}
     # auto card: "auto" flag ho, ya card ka apna ID uski file ka ID ho (file se bana tha, poster se nahi)
     AUTO = {int(k) for k, v in items
             if v.get("auto") or str(k) in (v.get("files") or {})
@@ -201,6 +207,11 @@ def find_target(ident, label_text, mid):
         extra = [i for i, (k, s) in NAMES.items() if i < mid and i not in AUTO and k and ckey(k) == ck]
         if extra:
             cands = extra
+    fy = re.search(r"(?<!\d)((?:19|20)\d{2})(?!\d)", ident or "")
+    if fy and len(cands) > 1:                        # file ke naam mein saal ho to usi saal wala card chuno
+        ym = [i for i in cands if YEARS.get(i) == fy.group(1)]
+        if ym:
+            cands = ym
     real = [i for i in cands if i not in AUTO]       # poster wale card ko pehle chuno
     if real:
         cands = real
@@ -372,9 +383,17 @@ async def on_channel_post(update, context):
                     title += f" - Episode {int(en[0])}"
             if NAMES is None:
                 load_names()
-            same = [i for i, (k, sn) in NAMES.items()
-                    if i != msg.message_id and i not in AUTO and k == title_key(title) and sn == dseason
-                    and db.reference(f"movies/{i}/title").get() and "Episode" not in title]
+            ny = str(d.get("year", "") or "")
+            same = []
+            for i, (k, sn) in NAMES.items():
+                if i == msg.message_id or i in AUTO or k != title_key(title) or sn != dseason or "Episode" in title:
+                    continue
+                if not db.reference(f"movies/{i}/title").get():
+                    continue
+                oy = YEARS.get(i, "")
+                if ny and oy and ny != oy:       # naam same par saal alag (Gunaah 2002 vs Gunaah 2024): alag movie/series
+                    continue
+                same.append(i)
             if same:
                 tgt = same[0]
                 added = 0
@@ -431,6 +450,7 @@ async def on_channel_post(update, context):
             if NAMES is None:
                 load_names()
             NAMES[msg.message_id] = (title_key(title), dseason)
+            YEARS[msg.message_id] = str(d.get("year", "") or "")
             touch_meta()
             mg = merge_autos()           # pehle aayi bina-poster files ab is card mein aa jayein
             print("Saved:", title, "| buttons:", len(btns), "| merge:", mg if mg else "-")
