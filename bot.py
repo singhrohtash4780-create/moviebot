@@ -127,6 +127,10 @@ def load_names():
         if keys:
             ALIASES[int(k)] = keys
 
+def ckey(k):
+    # spaces hata kar milao: "i m game" == "im game" (file mein I.m.Game, card mein Im Game)
+    return (k or "").replace(" ", "")
+
 def alias_hit(k, aliases):
     return any(k == a or k.startswith(a + " ") for a in aliases)
 
@@ -136,7 +140,7 @@ def merge_autos():
     merged = 0
     for i in sorted(AUTO):
         k, sn = NAMES.get(i, (None, 0))
-        real = [j for j, (kk, ss) in NAMES.items() if j not in AUTO and kk == k and ss == sn] if k else []
+        real = [j for j, (kk, ss) in NAMES.items() if j not in AUTO and ckey(kk) == ckey(k) and ss == sn] if k else []
         if not real and k:
             real = [j for j, al in ALIASES.items() if j not in AUTO and alias_hit(k, al)]
         if not real:
@@ -180,6 +184,10 @@ def find_target(ident, label_text, mid):
         if len(fb) >= 3:
             cands = [i for i, (k, sn) in NAMES.items() if i < mid and k and base_key(k) == fb]
     if not cands:
+        ck = ckey(fkey)
+        if len(ck) >= 3:       # spaces ka farq ("I.m.Game" vs "Im Game")
+            cands = [i for i, (k, s) in NAMES.items() if i < mid and k and ckey(k) == ck]
+    if not cands:
         # File ke naam ke aage site ka tag ho (jaise "Movies4u_Foo_The_Paradise") to movie ka naam beech mein bhi dhundho
         padded = " " + fkey + " "
         cands = [i for i, (k, s) in NAMES.items() if i < mid and len(k) >= 4 and (" " + k + " ") in padded]
@@ -188,6 +196,11 @@ def find_target(ident, label_text, mid):
             cands = [i for i in cands if len(NAMES[i][0]) == best]
     if not cands:
         return None, 0
+    if all(i in AUTO for i in cands):                # sirf bina-poster card mile: spaces hata kar poster wala card dhundo
+        ck = ckey(fkey)
+        extra = [i for i, (k, s) in NAMES.items() if i < mid and i not in AUTO and k and ckey(k) == ck]
+        if extra:
+            cands = extra
     real = [i for i in cands if i not in AUTO]       # poster wale card ko pehle chuno
     if real:
         cands = real
