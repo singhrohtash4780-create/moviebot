@@ -721,7 +721,26 @@ async def on_setname(update, context):
     old = str((items[hit]["files"][pid] or {}).get("file", ""))
     db.reference(f"movies/{hit}/files/{pid}/file").set(new)
     touch_meta()
-    await update.message.reply_text(f"File ka naam badal diya:\nPehle: {old or '(khali)'}\nAb: {new}")
+    # Backup channel/group mein is file ki copy ho to uska caption bhi naye naam par kar do
+    bmap = db.reference(f"backup/{pid}").get() or {}
+    bok = bfail = 0
+    for cid, copy_id in (bmap.items() if isinstance(bmap, dict) else []):
+        try:
+            await context.bot.edit_message_caption(chat_id=int(cid), message_id=int(copy_id), caption=new[:1024])
+            bok += 1
+        except Exception as e:
+            if "not modified" in str(e).lower():
+                bok += 1
+            else:
+                bfail += 1
+                print("Backup caption nahi badla:", cid, copy_id, type(e).__name__, str(e)[:100])
+        await asyncio.sleep(0.5)
+    msg = f"File ka naam badal diya:\nPehle: {old or '(khali)'}\nAb: {new}"
+    if bmap:
+        msg += f"\nBackup: {bok} jagah badla" + (f", {bfail} jagah nahi badla" if bfail else "") + "."
+    else:
+        msg += "\nBackup: is file ki koi backup copy nahi mili."
+    await update.message.reply_text(msg)
 
 async def on_rebuildindex(update, context):
     # /rebuildindex -> purani saari movies ka halka index ek baar mein banao (naya app chalane se pehle ek baar)
