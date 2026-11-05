@@ -658,6 +658,7 @@ async def on_help(update, context):
         "/merge - bina-poster wale faltu cards ko poster wale card mein milao\n"
         "/alias POSTER_LINK Naam - doosre naam ki files bhi us card mein lao (jaise Jannat 2)\n"
         "/setq FILE_POST_LINK 480p - file ki quality haath se set karo (label \"Watch\" ho to)\n"
+        "/setname FILE_POST_LINK Naya.Naam.mkv - file ka naam badlo (bot ye naam bhejta hai)\n"
         "/rebuildindex - app ke liye halka index banao (purani movies ke liye ek baar)\n"
         "/help - ye list\n\n"
         "Auto tareeka: poster ke caption mein ek line likho  Also: Jannat 2, Jannat 3  to un naamo ki files apne aap us card mein aayengi.")
@@ -699,6 +700,28 @@ async def on_setq(update, context):
     if miss:
         msg += "\nYe post app mein file ki tarah nahi mili: " + ", ".join(miss)
     await update.message.reply_text(msg + ("\nApp mein 3 minute ke andar badal jayega." if done else ""))
+
+async def on_setname(update, context):
+    # /setname FILE_POST_LINK Naya.File.Naam.mkv -> file ka naam badlo (bot ye naam caption mein bhejta hai)
+    if not await admin_ok(update):
+        return
+    parts = (update.message.text or "").split(None, 2)
+    mid = re.search(r"(\d+)\s*$", parts[1]) if len(parts) >= 2 else None
+    if not mid or len(parts) < 3 or not parts[2].strip():
+        await update.message.reply_text("Aise likho (file wali post ka link, phir naya naam):\n"
+                                        "/setname https://t.me/tumhara_channel/2720 Dhoondte.Reh.Jaaoge.2009.480p.WEB-DL.mkv")
+        return
+    pid, new = mid.group(1), parts[2].strip()[:300]
+    data = db.reference("movies").get() or {}
+    items = {str(k): v for k, v in (data.items() if isinstance(data, dict) else enumerate(data)) if v}
+    hit = next((k for k, v in items.items() if pid in (v.get("files") or {})), None)
+    if not hit:
+        await update.message.reply_text("Ye post app mein file ki tarah nahi mili: " + pid)
+        return
+    old = str((items[hit]["files"][pid] or {}).get("file", ""))
+    db.reference(f"movies/{hit}/files/{pid}/file").set(new)
+    touch_meta()
+    await update.message.reply_text(f"File ka naam badal diya:\nPehle: {old or '(khali)'}\nAb: {new}")
 
 async def on_rebuildindex(update, context):
     # /rebuildindex -> purani saari movies ka halka index ek baar mein banao (naya app chalane se pehle ek baar)
@@ -872,6 +895,7 @@ async def post_init(application):
                 BotCommand("merge", "Bina-poster faltu cards milao"),
                 BotCommand("alias", "Doosre naam ki files card mein lao"),
                 BotCommand("setq", "File ki quality (480p/720p/1080p) set karo"),
+                BotCommand("setname", "File ka naam badlo"),
                 BotCommand("rebuildindex", "App ka index dobara banao"),
                 BotCommand("start", "Bot shuru karo"),
             ], scope=BotCommandScopeChat(chat_id=ADMIN_ID))
@@ -961,6 +985,7 @@ app.add_handler(CommandHandler("merge", on_merge))
 app.add_handler(CommandHandler("rebuildindex", on_rebuildindex))
 app.add_handler(CommandHandler("alias", on_alias))
 app.add_handler(CommandHandler("setq", on_setq))
+app.add_handler(CommandHandler("setname", on_setname))
 app.add_handler(CommandHandler("help", on_help))
 app.add_error_handler(on_error)
 app.add_handler(MessageHandler(filters.PHOTO & filters.CaptionRegex(r"^/setlogo") & filters.ChatType.PRIVATE, on_setlogo))
