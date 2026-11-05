@@ -702,7 +702,7 @@ async def on_setq(update, context):
     await update.message.reply_text(msg + ("\nApp mein 3 minute ke andar badal jayega." if done else ""))
 
 async def on_setname(update, context):
-    # /setname FILE_POST_LINK Naya.File.Naam.mkv -> file ka naam badlo (bot ye naam caption mein bhejta hai)
+    # /setname FILE_POST_LINK Naya.File.Naam.mkv -> file ka naam badlo (bot ye naam caption mein bhejta hai; backup copy ka caption bhi badalta hai)
     if not await admin_ok(update):
         return
     parts = (update.message.text or "").split(None, 2)
@@ -711,7 +711,11 @@ async def on_setname(update, context):
         await update.message.reply_text("Aise likho (file wali post ka link, phir naya naam):\n"
                                         "/setname https://t.me/tumhara_channel/2720 Dhoondte.Reh.Jaaoge.2009.480p.WEB-DL.mkv")
         return
-    pid, new = mid.group(1), parts[2].strip()[:300]
+    pid, new = mid.group(1), parts[2].strip()
+    if re.search(r"https?://|t\.me/", new) or "\n" in new or len(new) > 200:
+        await update.message.reply_text("Naam mein link ya kai line nahi chalegi. Ek command mein ek hi file ka sirf naya naam likho:\n"
+                                        "/setname https://t.me/tumhara_channel/2720 Naya.Naam.mkv")
+        return
     data = db.reference("movies").get() or {}
     items = {str(k): v for k, v in (data.items() if isinstance(data, dict) else enumerate(data)) if v}
     hit = next((k for k, v in items.items() if pid in (v.get("files") or {})), None)
@@ -721,7 +725,6 @@ async def on_setname(update, context):
     old = str((items[hit]["files"][pid] or {}).get("file", ""))
     db.reference(f"movies/{hit}/files/{pid}/file").set(new)
     touch_meta()
-    # Backup channel/group mein is file ki copy ho to uska caption bhi naye naam par kar do
     bmap = db.reference(f"backup/{pid}").get() or {}
     bok = bfail = 0
     for cid, copy_id in (bmap.items() if isinstance(bmap, dict) else []):
@@ -914,7 +917,7 @@ async def post_init(application):
                 BotCommand("merge", "Bina-poster faltu cards milao"),
                 BotCommand("alias", "Doosre naam ki files card mein lao"),
                 BotCommand("setq", "File ki quality (480p/720p/1080p) set karo"),
-                BotCommand("setname", "File ka naam badlo"),
+                BotCommand("setname", "File ka naam badlo (caption + backup)"),
                 BotCommand("rebuildindex", "App ka index dobara banao"),
                 BotCommand("start", "Bot shuru karo"),
             ], scope=BotCommandScopeChat(chat_id=ADMIN_ID))
