@@ -393,6 +393,10 @@ async def on_channel_post(update, context):
         return
     name = getattr(media, "file_name", "") or ""
     caption = msg.caption or ""
+    # Caption mein "File Name : ..." ho to wahi asli naam hai (file ka naam hash jaisa ho sakta hai)
+    m_fn = re.search(r"file\s*name\s*[:\-]\s*(.+)", caption, re.I)
+    if m_fn and m_fn.group(1).strip():
+        name = m_fn.group(1).strip()
     first = caption.strip().splitlines()[0] if caption.strip() else ""
     ident = name if file_name_key(name) else first      # naam kahan se len
     target, cseason = find_target(ident, name + " " + caption, msg.message_id)
