@@ -23,7 +23,8 @@ firebase_admin.initialize_app(
 FIELDS = {"movie name": "name", "series name": "name", "release year": "year",
           "released year": "year", "language": "language", "quality": "quality",
           "format": "format", "season": "season", "episode": "episode",
-          "year": "year", "released": "year", "languages": "language", "audio": "language"}
+          "year": "year", "released": "year", "languages": "language", "audio": "language",
+          "first aired": "year", "aired": "year", "genres": "genre", "genre": "genre", "type": "type", "status": "status"}
 
 def parse_details(text):
     out = {}
@@ -48,7 +49,7 @@ def guess_name(text, d, has_buttons):
     name = re.sub(r"^[\W_]+", "", lines[0]).strip(" -~|*_")
     if len(name) < 2:
         return None
-    looks_like_post = has_buttons or any(k in d for k in ("language", "format", "quality", "year", "season", "episode"))
+    looks_like_post = has_buttons or any(k in d for k in ("language", "format", "quality", "year", "season", "episode", "genre", "type"))
     return name if looks_like_post else None
 
 def parse_pipe(text):
@@ -89,7 +90,14 @@ def strip_tag(s):
 def norm(s):
     return re.sub(r"[^a-z0-9]+", " ", (s or "").lower()).strip()
 
+def junk_name(fname):
+    # Hash ya sirf number jaisa naam ("d73cdf6d...357.mkv", "5_6269527456059755565.mov"): isme movie ka naam nahi hota
+    stem = re.sub(r"\.[A-Za-z0-9]{2,4}$", "", fname or "").strip()
+    return bool(stem) and (bool(re.fullmatch(r"[0-9a-fA-F_\-\s]{12,}", stem)) or len(re.sub(r"[^A-Za-z]", "", stem)) < 3)
+
 def file_name_key(fname):
+    if junk_name(fname):
+        return ""
     base = strip_tag(re.sub(r"\.[A-Za-z0-9]{2,4}$", "", fname or ""))
     m = STOP.search(base)
     return norm(base[:m.start()] if m else base)
@@ -124,7 +132,7 @@ def load_names():
     # auto card: "auto" flag ho, ya card ka apna ID uski file ka ID ho (file se bana tha, poster se nahi)
     AUTO = {int(k) for k, v in items
             if v.get("auto") or str(k) in (v.get("files") or {})
-            or not (v.get("language") or v.get("quality") or v.get("format"))}
+            or not (v.get("poster") or v.get("language") or v.get("quality") or v.get("format"))}
     ALIASES = {}
     for k, v in items:
         al = v.get("alias") or []
@@ -206,8 +214,9 @@ def find_target(ident, label_text, mid):
         load_names()
     fkey = file_name_key(ident)
     _, fseason = make_label(label_text)
-    if not fkey:   # naam hi nahi mila: sabse nayi movie
+    if not fkey:   # naam hi nahi mila: sabse nayi poster wali movie/drama (poster wali na ho to koi bhi sabse nayi)
         older = [i for i in NAMES if i < mid]
+        older = [i for i in older if i not in AUTO] or older
         return (max(older), NAMES[max(older)][1]) if older else (None, 0)
     cands = [i for i, al in ALIASES.items() if i < mid and alias_hit(fkey, al)]     # /alias se jode doosre naam
     if not cands:
@@ -390,6 +399,11 @@ async def on_channel_post(update, context):
             g = guess_name(msg.caption, d, bool(msg.reply_markup and msg.reply_markup.inline_keyboard))
             if g:
                 d["name"] = g
+        ym = re.search(r"(?:19|20)\d{2}", d.get("year", "") or "")      # "2022-9-9" -> "2022"
+        if ym:
+            d["year"] = ym.group(0)
+        else:
+            d.pop("year", None)
         if "name" in d:
             title = d["name"] + (f" ({d['year']})" if d.get("year") else "")
             nums = re.findall(r"\d+", d.get("season", ""))
@@ -467,6 +481,7 @@ async def on_channel_post(update, context):
                 "season": dseason,
                 "link": base + str(msg.message_id),
                 "date": msg.date.isoformat(),
+                "poster": True,       # poster post se bani card (language/quality na ho tab bhi bina-poster card na maani jaye)
             }
             if d.get("alias"):
                 card["alias"] = d["alias"]
@@ -499,18 +514,33 @@ async def on_channel_post(update, context):
     caption = msg.caption or ""
     # Caption mein "File Name : ..." ho to wahi asli naam hai (file ka naam hash jaisa ho sakta hai)
     doc_name = name                      # file ka apna naam (hash/kuch bhi ho sakta hai)
+    has_name = bool(doc_name) and not junk_name(doc_name)     # file ya caption mein asli naam mila?
     m_fn = (re.search(r"file[\s_]*name\s*[:\-\u2013=]\s*(.+)", caption, re.I)
             or re.search(r"^\W*file\s*[:\-\u2013=]\s*(.+)", caption, re.I | re.M))
     if m_fn and m_fn.group(1).strip():
         name = m_fn.group(1).strip()
+        has_name = True
+    elif junk_name(doc_name) or not doc_name:
+        # Caption mein "Title'-" / "Title:" / "Name:" ke baad movie ka naam (agli line mein bhi ho sakta hai)
+        m_t = re.search(r"^\W*(?:title|movie\s*name|name)\s*['\u2019`]*\s*[:\-\u2013=]*\s*([^\n]+)", caption, re.I | re.M)
+        t = m_t.group(1).strip(" \t-:'\u2019") if m_t else ""
+        if t and not re.fullmatch(r"(?:movie|series|hindi|english)\b.*", t, re.I):
+            q = re.search(r"(2160|1080|720|480|360)p", caption, re.I)
+            name = t + (f" {q.group(1)}p" if q else "")
+            has_name = True
     first = caption.strip().splitlines()[0] if caption.strip() else ""
     ident = name if file_name_key(name) else first      # naam kahan se len
     target, cseason = find_target(ident, name + " " + caption, msg.message_id)
     if not target and doc_name and doc_name != name and file_name_key(doc_name):    # caption ka naam na mile to file ka apna naam bhi try karo
         target, cseason = find_target(doc_name, doc_name + " " + caption, msg.message_id)
 
+    if not target and not has_name:      # file ya caption mein koi naam nahi: sabse nayi poster wali movie/drama ke saath jodo
+        target, cseason = find_target("", name + " " + caption, msg.message_id)
+        if target:
+            print("Naam nahi mila, sabse nayi poster ke saath jodi:", target)
+
     # Koi movie match nahi hui par naam saaf hai: nayi card banao (thumbnail ko poster banakar)
-    if not target and file_name_key(ident):
+    if not target and has_name and file_name_key(ident):
         poster = ""
         thumb = getattr(media, "thumbnail", None)
         if thumb:
