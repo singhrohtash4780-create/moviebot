@@ -137,8 +137,34 @@ def ckey(k):
     # spaces hata kar milao: "i m game" == "im game" (file mein I.m.Game, card mein Im Game)
     return (k or "").replace(" ", "")
 
+def same_name(a, b):
+    # Naam barabar, ya ek naam doosre ka kata hua hissa ho ("...exit of go" / "...exit of goodbyes"): Telegram lamba naam kaat deta hai
+    ca, cb = ckey(a), ckey(b)
+    if not ca or not cb:
+        return False
+    if ca == cb:
+        return True
+    lo, hi = (ca, cb) if len(ca) <= len(cb) else (cb, ca)
+    ls, hs = (a, b) if len(a) <= len(b) else (b, a)
+    # Kata hua naam: chhota naam lambe ka shuru ka hissa ho aur kaat beech word mein ho ("...exit of go" / "...exit of goodbyes")
+    if len(lo) >= 15 and hs.startswith(ls) and len(hs) > len(ls) and hs[len(ls)] != " ":
+        return True
+    # Beech/shuru ke 1-2 chhote words gayab (jaise "the"): chhote naam ke saare words, usi order mein, lambe naam mein hon
+    wa, wb = a.split(), b.split()
+    ws, wl = (wa, wb) if len(wa) <= len(wb) else (wb, wa)
+    if len(ws) < 3 or len(wl) - len(ws) > 2:
+        return False
+    it = iter(wl)
+    if not all(w in it for w in ws):             # order mein subsequence
+        return False
+    left = list(wl)
+    for w in ws:
+        left.remove(w)
+    # bhaag/season ka number ya "part" gayab ho to alag movie hai (Kung Fu Panda / Kung Fu Panda 2)
+    return not any(re.search(r"\d", w) or w in ("part", "chapter", "season", "vol", "volume", "episode", "returns") for w in left)
+
 def alias_hit(k, aliases):
-    return any(k == a or k.startswith(a + " ") for a in aliases)
+    return any(k == a or k.startswith(a + " ") or same_name(k, a) for a in aliases)
 
 def merge_autos():
     """Bina-poster wale card ki files, usi naam ke poster wale card mein daalo aur khali card hata do."""
@@ -146,12 +172,15 @@ def merge_autos():
     merged = 0
     for i in sorted(AUTO):
         k, sn = NAMES.get(i, (None, 0))
-        real = [j for j, (kk, ss) in NAMES.items() if j not in AUTO and ckey(kk) == ckey(k) and ss == sn] if k else []
+        real = [j for j, (kk, ss) in NAMES.items() if j not in AUTO and same_name(kk, k) and ss == sn] if k else []
         if not real and k:
             real = [j for j, al in ALIASES.items() if j not in AUTO and alias_hit(k, al)]
+        if not real and k:       # poster wala card nahi: kata hua naam apne lambe naam wale bina-poster card mein milao
+            real = [j for j in AUTO if j != i and NAMES.get(j) and NAMES[j][1] == sn
+                    and len(ckey(NAMES[j][0])) > len(ckey(k)) and same_name(NAMES[j][0], k)]
         if not real:
             continue
-        tgt = max(real)
+        tgt = max(real, key=lambda j: (len(ckey(NAMES[j][0])), j))
         ex = db.reference(f"movies/{i}/files").get() or {}
         for fid, ef in (ex.items() if isinstance(ex, dict) else enumerate(ex)):
             if ef and not is_duplicate_file(tgt, fid, ef.get("uid", ""), ef.get("file", ""), ef.get("size", "")):
@@ -192,7 +221,7 @@ def find_target(ident, label_text, mid):
     if not cands:
         ck = ckey(fkey)
         if len(ck) >= 3:       # spaces ka farq ("I.m.Game" vs "Im Game")
-            cands = [i for i, (k, s) in NAMES.items() if i < mid and k and ckey(k) == ck]
+            cands = [i for i, (k, s) in NAMES.items() if i < mid and k and same_name(k, fkey)]
     if not cands:
         # File ke naam ke aage site ka tag ho (jaise "Movies4u_Foo_The_Paradise") to movie ka naam beech mein bhi dhundho
         padded = " " + fkey + " "
@@ -204,7 +233,7 @@ def find_target(ident, label_text, mid):
         return None, 0
     if all(i in AUTO for i in cands):                # sirf bina-poster card mile: spaces hata kar poster wala card dhundo
         ck = ckey(fkey)
-        extra = [i for i, (k, s) in NAMES.items() if i < mid and i not in AUTO and k and ckey(k) == ck]
+        extra = [i for i, (k, s) in NAMES.items() if i < mid and i not in AUTO and k and same_name(k, fkey)]
         if extra:
             cands = extra
     fy = re.search(r"(?<!\d)((?:19|20)\d{2})(?!\d)", ident or "")
@@ -469,12 +498,16 @@ async def on_channel_post(update, context):
     name = getattr(media, "file_name", "") or ""
     caption = msg.caption or ""
     # Caption mein "File Name : ..." ho to wahi asli naam hai (file ka naam hash jaisa ho sakta hai)
-    m_fn = re.search(r"file\s*name\s*[:\-]\s*(.+)", caption, re.I)
+    doc_name = name                      # file ka apna naam (hash/kuch bhi ho sakta hai)
+    m_fn = (re.search(r"file[\s_]*name\s*[:\-\u2013=]\s*(.+)", caption, re.I)
+            or re.search(r"^\W*file\s*[:\-\u2013=]\s*(.+)", caption, re.I | re.M))
     if m_fn and m_fn.group(1).strip():
         name = m_fn.group(1).strip()
     first = caption.strip().splitlines()[0] if caption.strip() else ""
     ident = name if file_name_key(name) else first      # naam kahan se len
     target, cseason = find_target(ident, name + " " + caption, msg.message_id)
+    if not target and doc_name and doc_name != name and file_name_key(doc_name):    # caption ka naam na mile to file ka apna naam bhi try karo
+        target, cseason = find_target(doc_name, doc_name + " " + caption, msg.message_id)
 
     # Koi movie match nahi hui par naam saaf hai: nayi card banao (thumbnail ko poster banakar)
     if not target and file_name_key(ident):
