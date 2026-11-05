@@ -630,9 +630,48 @@ async def on_help(update, context):
         "/delete POST_LINK - APP, CHANNEL aur BACKUP, teeno se hatao (range: /delete LINK/40-50)\n"
         "/merge - bina-poster wale faltu cards ko poster wale card mein milao\n"
         "/alias POSTER_LINK Naam - doosre naam ki files bhi us card mein lao (jaise Jannat 2)\n"
+        "/setq FILE_POST_LINK 480p - file ki quality haath se set karo (label \"Watch\" ho to)\n"
         "/rebuildindex - app ke liye halka index banao (purani movies ke liye ek baar)\n"
         "/help - ye list\n\n"
         "Auto tareeka: poster ke caption mein ek line likho  Also: Jannat 2, Jannat 3  to un naamo ki files apne aap us card mein aayengi.")
+
+async def on_setq(update, context):
+    # /setq POST_LINK 480p [POST_LINK 720p ...] -> file ka quality label haath se set karo (label "Watch" ho to)
+    if not await admin_ok(update):
+        return
+    a = context.args
+    pairs = []
+    for i in range(0, len(a) - 1, 2):
+        mid = re.search(r"(\d+)\s*$", a[i])
+        qm = re.fullmatch(r"(2160|1080|720|480|360)p?", a[i + 1].strip(), re.I)
+        if mid and qm:
+            pairs.append((mid.group(1), qm.group(1) + "p"))
+    if not pairs or len(a) % 2:
+        await update.message.reply_text("Aise likho (file wali post ka link, phir quality):\n"
+                                        "/setq https://t.me/tumhara_channel/2720 480p\n"
+                                        "Ek saath kai: /setq LINK1 480p LINK2 720p LINK3 1080p")
+        return
+    data = db.reference("movies").get() or {}
+    items = {str(k): v for k, v in (data.items() if isinstance(data, dict) else enumerate(data)) if v}
+    done, miss = [], []
+    for pid, q in pairs:
+        hit = next(((k, v) for k, v in items.items() if pid in (v.get("files") or {})), None)
+        if not hit:
+            miss.append(pid)
+            continue
+        k, v = hit
+        old = str((v["files"][pid] or {}).get("label", ""))
+        tag = re.sub(r"(2160|1080|720|480|360)p", "", old, flags=re.I).strip()
+        tag = "" if tag.lower() == "watch" else tag
+        label = (tag + " " + q).strip()
+        db.reference(f"movies/{k}/files/{pid}/label").set(label)
+        done.append(f"{pid} -> {label}")
+    if done:
+        touch_meta()
+    msg = ("Label badal diye:\n" + "\n".join(done)) if done else "Koi file nahi mili."
+    if miss:
+        msg += "\nYe post app mein file ki tarah nahi mili: " + ", ".join(miss)
+    await update.message.reply_text(msg + ("\nApp mein 3 minute ke andar badal jayega." if done else ""))
 
 async def on_rebuildindex(update, context):
     # /rebuildindex -> purani saari movies ka halka index ek baar mein banao (naya app chalane se pehle ek baar)
@@ -805,6 +844,7 @@ async def post_init(application):
                 BotCommand("delete", "App, channel aur backup teeno se hatao"),
                 BotCommand("merge", "Bina-poster faltu cards milao"),
                 BotCommand("alias", "Doosre naam ki files card mein lao"),
+                BotCommand("setq", "File ki quality (480p/720p/1080p) set karo"),
                 BotCommand("rebuildindex", "App ka index dobara banao"),
                 BotCommand("start", "Bot shuru karo"),
             ], scope=BotCommandScopeChat(chat_id=ADMIN_ID))
@@ -893,6 +933,7 @@ app.add_handler(CommandHandler("delete", on_delete))
 app.add_handler(CommandHandler("merge", on_merge))
 app.add_handler(CommandHandler("rebuildindex", on_rebuildindex))
 app.add_handler(CommandHandler("alias", on_alias))
+app.add_handler(CommandHandler("setq", on_setq))
 app.add_handler(CommandHandler("help", on_help))
 app.add_error_handler(on_error)
 app.add_handler(MessageHandler(filters.PHOTO & filters.CaptionRegex(r"^/setlogo") & filters.ChatType.PRIVATE, on_setlogo))
