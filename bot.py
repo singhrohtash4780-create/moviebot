@@ -133,6 +133,7 @@ def merge_autos():
                 db.reference(f"movies/{tgt}/files/{fid}").set(ef)
         db.reference(f"movies/{i}").delete()
         db.reference(f"posters/{i}").delete()
+        db.reference(f"index/{i}").delete()
         merged += 1
     if merged:
         load_names()
@@ -181,7 +182,7 @@ def find_target(ident, label_text, mid):
     return target, NAMES[target][1]
 
 # ---- Poster: patti hatao, landscape ko blur canvas par rakho, chhota WebP banao ----
-POSTER_W, POSTER_H = 240, 360
+POSTER_W, POSTER_H = 200, 300
 
 def strip_bottom_bar(img):
     """Neeche ki safed patti (jisme doosre channel ka naam hota hai) ho to hata do.
@@ -227,13 +228,17 @@ def make_poster(img):
         out.thumbnail((POSTER_W, POSTER_H))
     buf = io.BytesIO()
     try:
-        out.save(buf, "WEBP", quality=60, method=6)
+        out.save(buf, "WEBP", quality=50, method=6)
         mime = "image/webp"
     except Exception:                      # WebP support na ho to JPEG
         buf = io.BytesIO()
-        out.save(buf, "JPEG", quality=60, optimize=True)
+        out.save(buf, "JPEG", quality=50, optimize=True)
         mime = "image/jpeg"
     return f"data:{mime};base64," + base64.b64encode(buf.getvalue()).decode()
+
+def index_set(cid, card):
+    """Halka index (sirf naam, quality, date): app list isse banati hai, poora movie data nahi mangti."""
+    db.reference(f"index/{cid}").set({"title": card.get("title", ""), "quality": card.get("quality", ""), "date": card.get("date", "")})
 
 def touch_meta():
     # App har kuch minute mein sirf yahi chhoti value padhta hai; badli ho tabhi poori list laata hai
@@ -363,6 +368,7 @@ async def on_channel_post(update, context):
             if d.get("alias"):
                 card["alias"] = d["alias"]
             movies.child(str(msg.message_id)).update(card)
+            index_set(msg.message_id, card)
             db.reference("posters").child(str(msg.message_id)).set(poster)
             for i, (text, url) in enumerate(btns):
                 movies.child(str(msg.message_id)).child("files").child(f"{msg.message_id}_{i}").set(
@@ -411,6 +417,7 @@ async def on_channel_post(update, context):
             db.reference("posters").child(str(msg.message_id)).set(poster)
         NAMES[msg.message_id] = (title_key(title), 0)
         AUTO.add(msg.message_id)
+        index_set(msg.message_id, {"title": title, "quality": "", "date": msg.date.isoformat()})
         target, cseason = msg.message_id, 0
         print("Nayi card bani:", title)
 
@@ -590,8 +597,21 @@ async def on_help(update, context):
         "/delete POST_LINK - APP, CHANNEL aur BACKUP, teeno se hatao (range: /delete LINK/40-50)\n"
         "/merge - bina-poster wale faltu cards ko poster wale card mein milao\n"
         "/alias POSTER_LINK Naam - doosre naam ki files bhi us card mein lao (jaise Jannat 2)\n"
+        "/rebuildindex - app ke liye halka index banao (purani movies ke liye ek baar)\n"
         "/help - ye list\n\n"
         "Auto tareeka: poster ke caption mein ek line likho  Also: Jannat 2, Jannat 3  to un naamo ki files apne aap us card mein aayengi.")
+
+async def on_rebuildindex(update, context):
+    # /rebuildindex -> purani saari movies ka halka index ek baar mein banao (naya app chalane se pehle ek baar)
+    if not await admin_ok(update):
+        return
+    data = db.reference("movies").get() or {}
+    items = data.items() if isinstance(data, dict) else enumerate(data)
+    idx = {str(k): {"title": v.get("title", ""), "quality": v.get("quality", ""), "date": v.get("date", "")}
+           for k, v in items if v and v.get("title")}
+    db.reference("index").set(idx)
+    touch_meta()
+    await update.message.reply_text(f"Index ban gaya: {len(idx)} movies. Ab nayi site chalu kar sakte ho.")
 
 async def on_merge(update, context):
     # /merge -> bina-poster wale faltu cards ki files poster wale card mein jod do
@@ -625,6 +645,7 @@ def app_remove(ids):
             titles.append(items[pid].get("title", ""))
             db.reference(f"movies/{pid}").delete()
             db.reference(f"posters/{pid}").delete()
+            db.reference(f"index/{pid}").delete()
             items.pop(pid, None)
             cards += 1
             continue
@@ -638,6 +659,7 @@ def app_remove(ids):
                     titles.append(v.get("title", ""))
                     db.reference(f"movies/{k}").delete()
                     db.reference(f"posters/{k}").delete()
+                    db.reference(f"index/{k}").delete()
                     items.pop(k, None)
                     cards += 1
                 break
@@ -719,6 +741,11 @@ async def on_delete(update, context):
     if ch["fail"] or bk["fail"]:
         lines.append("Jo nahi hui uski wajah: bot ko wahan Admin banao aur 'Delete messages' permission do. Telegram bahut purani (48 ghante se zyada) posts bhi kabhi nahi hatata.")
     await update.message.reply_text("\n".join(lines))
+
+async def on_error(update, context):
+    # Network ki chhoti dikkat (Telegram tak nahi pahunch paya) par lambi traceback ki jagah ek line likho
+    err = context.error
+    print("Error:", type(err).__name__, str(err)[:150])
 
 async def post_init(application):
     me = await application.bot.get_me()
@@ -807,8 +834,10 @@ app.add_handler(CommandHandler("setlogo", on_setlogo))
 app.add_handler(CommandHandler("remove", on_remove))
 app.add_handler(CommandHandler("delete", on_delete))
 app.add_handler(CommandHandler("merge", on_merge))
+app.add_handler(CommandHandler("rebuildindex", on_rebuildindex))
 app.add_handler(CommandHandler("alias", on_alias))
 app.add_handler(CommandHandler("help", on_help))
+app.add_error_handler(on_error)
 app.add_handler(MessageHandler(filters.PHOTO & filters.CaptionRegex(r"^/setlogo") & filters.ChatType.PRIVATE, on_setlogo))
 app.add_handler(MessageHandler(filters.UpdateType.CHANNEL_POST | filters.UpdateType.EDITED_CHANNEL_POST, on_channel_post))
 try:
