@@ -73,16 +73,30 @@ def make_label(text, default_season=0):
 # ---- File ke naam se movie dhundhne ke helpers ----
 STOP = re.compile(r"[ ._-]*(?:S\d{1,2}E\d|S\d{1,2}(?![A-Za-z])|Season|(?<![A-Za-z])E\d{1,3}(?!\d)|(?:19|20)\d{2}|2160p|1080p|720p|480p|360p)", re.I)
 
+# Naam ke shuru ka site ka tag: "(Movies4u.Bid).", "[1TamilMV] -", "www.site.com -" (movie ka naam nahi hota)
+LEAD_TAG = re.compile(r"^\s*(?:[\(\[\{][^\)\]\}]*[A-Za-z][^\)\]\}]*[\)\]\}]|www\.[A-Za-z0-9-]+\.[A-Za-z]{2,}"
+                      r"|[A-Za-z0-9-]+\.(?:com|net|org|in|me|tv|bid|xyz|to|cc|lol|site|club|live)(?![A-Za-z0-9]))[\s._-]*", re.I)
+
+def strip_tag(s):
+    s = s or ""
+    for _ in range(3):
+        m = LEAD_TAG.match(s)
+        if not m or not s[m.end():].strip():
+            break
+        s = s[m.end():]
+    return s
+
 def norm(s):
     return re.sub(r"[^a-z0-9]+", " ", (s or "").lower()).strip()
 
 def file_name_key(fname):
-    base = re.sub(r"\.[A-Za-z0-9]{2,4}$", "", fname or "")
+    base = strip_tag(re.sub(r"\.[A-Za-z0-9]{2,4}$", "", fname or ""))
     m = STOP.search(base)
     return norm(base[:m.start()] if m else base)
 
 def title_key(title):
-    t = re.sub(r"\s*-\s*Season\s*\d+\s*$", "", title or "", flags=re.I)
+    t = strip_tag(title)
+    t = re.sub(r"\s*-\s*Season\s*\d+\s*$", "", t, flags=re.I)
     t = re.sub(r"\s*\((?:19|20)\d{2}(?:\s*[-\u2013~]\s*(?:19|20)\d{2})?\)\s*$", "", t)
     return norm(t)
 
@@ -142,7 +156,7 @@ def merge_autos():
     return merged
 
 def pretty_title(ident):
-    base = re.sub(r"\.[A-Za-z0-9]{2,4}$", "", ident or "")
+    base = strip_tag(re.sub(r"\.[A-Za-z0-9]{2,4}$", "", ident or ""))
     m = STOP.search(base)
     raw = base[:m.start()] if m else base
     return re.sub(r"[._]+", " ", raw).strip() or "Untitled"
