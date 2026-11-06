@@ -97,8 +97,13 @@ def strip_tag(s):
         s = s[m.end():]
     return s
 
+FILLER = {"the", "movie", "film"}     # naam mein ho ya na ho, farq nahi ("Doraemon the Movie ..." / "Doraemon ...")
+
 def norm(s):
-    return re.sub(r"[^a-z0-9]+", " ", (s or "").lower()).strip()
+    s = re.sub(r"[\u2019\u2018'`\u00b4]", "", (s or "").lower())      # Nobita's / Nobita\u2019s -> nobitas (alag word nahi banta)
+    words = re.sub(r"[^a-z0-9]+", " ", s).split()
+    kept = [w for w in words if w not in FILLER]
+    return " ".join(kept or words)
 
 def junk_name(fname):
     # Hash ya sirf number jaisa naam ("d73cdf6d...357.mkv", "5_6269527456059755565.mov"): isme movie ka naam nahi hota
@@ -142,7 +147,7 @@ def load_names():
     # auto card: "auto" flag ho, ya card ka apna ID uski file ka ID ho (file se bana tha, poster se nahi)
     AUTO = {int(k) for k, v in items
             if v.get("auto") or str(k) in (v.get("files") or {})
-            or not (v.get("poster") or v.get("language") or v.get("quality") or v.get("format"))}
+            or not (v.get("pcard") or v.get("poster") is True or v.get("language") or v.get("quality") or v.get("format"))}
     ALIASES = {}
     for k, v in items:
         al = v.get("alias") or []
@@ -325,7 +330,11 @@ def make_poster(img):
 
 def index_set(cid, card):
     """Halka index (sirf naam, quality, date): app list isse banati hai, poora movie data nahi mangti."""
-    db.reference(f"index/{cid}").set({"title": card.get("title", ""), "quality": card.get("quality", ""), "date": card.get("date", "")})
+    d = {"title": card.get("title", ""), "quality": card.get("quality", ""), "date": card.get("date", "")}
+    pin = card.get("pin") or db.reference(f"movies/{cid}/pin").get()
+    if pin:
+        d["pin"] = pin                     # pin ki hui movie website par upar rehti hai
+    db.reference(f"index/{cid}").set(d)
 
 def touch_meta():
     # App har kuch minute mein sirf yahi chhoti value padhta hai; badli ho tabhi poori list laata hai
@@ -518,7 +527,7 @@ async def on_channel_post(update, context):
                 "season": dseason,
                 "link": base + str(msg.message_id),
                 "date": msg.date.isoformat(),
-                "poster": True,       # poster post se bani card (language/quality na ho tab bhi bina-poster card na maani jaye)
+                "pcard": True,        # poster post se bani card (language/quality na ho tab bhi bina-poster card na maani jaye). Naam "poster" nahi: website us naam se poster ki image padhti hai
             }
             if d.get("alias"):
                 card["alias"] = d["alias"]
@@ -779,6 +788,9 @@ async def on_help(update, context):
         "/alias POSTER_LINK Naam - doosre naam ki files bhi us card mein lao (jaise Jannat 2)\n"
         "/setq FILE_POST_LINK 480p - file ki quality haath se set karo (label \"Watch\" ho to)\n"
         "/setname LINK Naya.Naam.mkv - file ka naam badlo (kai file: har line mein LINK aur naam)\n"
+        "/pin POST_LINK ya movie ka naam - movie ko website par sabse upar pin karo\n"
+        "/unpin POST_LINK ya naam - pin hatao\n"
+        "/pins - pin ki hui movies ki list\n"
         "/rebuildindex - app ke liye halka index banao (purani movies ke liye ek baar)\n"
         "/help - ye list\n\n"
         "Auto tareeka: poster ke caption mein ek line likho  Also: Jannat 2, Jannat 3  to un naamo ki files apne aap us card mein aayengi.")
@@ -880,11 +892,96 @@ async def on_rebuildindex(update, context):
         return
     data = db.reference("movies").get() or {}
     items = data.items() if isinstance(data, dict) else enumerate(data)
-    idx = {str(k): {"title": v.get("title", ""), "quality": v.get("quality", ""), "date": v.get("date", "")}
-           for k, v in items if v and v.get("title")}
+    idx = {}
+    for k, v in items:
+        if v and v.get("title"):
+            idx[str(k)] = {"title": v.get("title", ""), "quality": v.get("quality", ""), "date": v.get("date", "")}
+            if v.get("pin"):
+                idx[str(k)]["pin"] = v["pin"]
     db.reference("index").set(idx)
     touch_meta()
     await update.message.reply_text(f"Index ban gaya: {len(idx)} movies. Ab nayi site chalu kar sakte ho.")
+
+MAX_PINS = 8      # ek saath zyada se zyada kitni movies pin ho sakti hain (naya pin karne par sabse purani hat jati hai)
+
+def resolve_card(arg):
+    """'https://t.me/ch/468', '468' ya movie ka naam -> (card_id, title)  ya  (None, jawab ka text)"""
+    arg = (arg or "").strip()
+    mt = re.search(r"(?:/|^)(\d+)\s*$", arg)
+    if mt:
+        cid = mt.group(1)
+        title = db.reference(f"movies/{cid}/title").get()
+        if title:
+            return cid, title
+        return None, "Ye post app mein movie ke card ke roop mein nahi mili. Movie ke poster post ka link do, ya movie ka naam likho."
+    qk = title_key(arg)
+    if not qk:
+        return None, "Movie ka naam ya poster post ka link likho."
+    idx = db.reference("index").get() or {}
+    hits = [(k, v.get("title", "")) for k, v in idx.items() if v and qk in title_key(v.get("title", ""))]
+    if not hits:                       # index mein na mile (ya abhi bana na ho) to poori movies mein dhundo
+        mv = db.reference("movies").get() or {}
+        hits = [(k, v.get("title", "")) for k, v in mv.items() if v and qk in title_key(v.get("title", ""))]
+    exact = [h for h in hits if title_key(h[1]) == qk]
+    if len(exact) == 1:
+        return exact[0]
+    if len(hits) == 1:
+        return hits[0]
+    if not hits:
+        return None, "Is naam ki koi movie nahi mili."
+    lst = "\n".join(f"{k} - {t}" for k, t in hits[:6])
+    return None, "Kai movies mili, kaun si? Number ke saath likho (jaise /pin 468):\n" + lst
+
+def pinned_list():
+    idx = db.reference("index").get() or {}
+    rows = [(k, v.get("pin", 0), v.get("title", "")) for k, v in idx.items() if v and v.get("pin")]
+    return sorted(rows, key=lambda r: r[1], reverse=True)
+
+async def on_pin(update, context):
+    # /pin POST_LINK  ya  /pin Movie Ka Naam -> movie website par sabse upar (Pinned) dikhti hai
+    if not await admin_ok(update):
+        return
+    arg = " ".join(context.args).strip()
+    if not arg:
+        await update.message.reply_text("Aise likho:\n/pin https://t.me/tumhara_channel/468\n/pin Gangs of Wasseypur\n"
+                                        "Pin hatane ke liye /unpin, pin ki list ke liye /pins")
+        return
+    cid, info = resolve_card(arg)
+    if not cid:
+        await update.message.reply_text(info)
+        return
+    db.reference(f"movies/{cid}").update({"pin": int(time.time() * 1000)})
+    index_set(cid, db.reference(f"movies/{cid}").get() or {})
+    for k, _, _ in pinned_list()[MAX_PINS:]:           # zyada pin hon to sabse purani hata do
+        db.reference(f"movies/{k}/pin").delete()
+        index_set(k, db.reference(f"movies/{k}").get() or {})
+    touch_meta()
+    await update.message.reply_text(f"Pin ho gayi: {info}\nAb ye website par sabse upar dikhegi (3 minute ke andar).")
+
+async def on_unpin(update, context):
+    if not await admin_ok(update):
+        return
+    arg = " ".join(context.args).strip()
+    if not arg:
+        await update.message.reply_text("Aise likho: /unpin https://t.me/tumhara_channel/468  ya  /unpin Movie Ka Naam")
+        return
+    cid, info = resolve_card(arg)
+    if not cid:
+        await update.message.reply_text(info)
+        return
+    db.reference(f"movies/{cid}/pin").delete()
+    index_set(cid, db.reference(f"movies/{cid}").get() or {})
+    touch_meta()
+    await update.message.reply_text(f"Pin hata di: {info}")
+
+async def on_pins(update, context):
+    if not await admin_ok(update):
+        return
+    rows = pinned_list()
+    if not rows:
+        await update.message.reply_text("Abhi koi movie pin nahi hai. Pin karne ke liye: /pin LINK ya /pin Naam")
+        return
+    await update.message.reply_text("Pin ki hui movies (upar se neeche):\n" + "\n".join(f"{k} - {t}" for k, _, t in rows))
 
 async def on_merge(update, context):
     # /merge -> bina-poster wale faltu cards ki files poster wale card mein jod do
@@ -1047,6 +1144,9 @@ async def post_init(application):
                 BotCommand("alias", "Doosre naam ki files card mein lao"),
                 BotCommand("setq", "File ki quality (480p/720p/1080p) set karo"),
                 BotCommand("setname", "File ka naam badlo (caption + backup)"),
+                BotCommand("pin", "Movie ko website par sabse upar pin karo"),
+                BotCommand("unpin", "Pin hatao"),
+                BotCommand("pins", "Pin ki hui movies ki list"),
                 BotCommand("rebuildindex", "App ka index dobara banao"),
                 BotCommand("start", "Bot shuru karo"),
             ], scope=BotCommandScopeChat(chat_id=ADMIN_ID))
@@ -1134,6 +1234,9 @@ app.add_handler(CommandHandler("remove", on_remove))
 app.add_handler(CommandHandler("delete", on_delete))
 app.add_handler(CommandHandler("merge", on_merge))
 app.add_handler(CommandHandler("rebuildindex", on_rebuildindex))
+app.add_handler(CommandHandler("pin", on_pin))
+app.add_handler(CommandHandler("unpin", on_unpin))
+app.add_handler(CommandHandler("pins", on_pins))
 app.add_handler(CommandHandler("alias", on_alias))
 app.add_handler(CommandHandler("setq", on_setq))
 app.add_handler(CommandHandler("setname", on_setname))
