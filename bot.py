@@ -24,7 +24,7 @@ FIELDS = {"movie name": "name", "series name": "name", "release year": "year",
           "released year": "year", "language": "language", "quality": "quality",
           "format": "format", "season": "season", "episode": "episode",
           "year": "year", "released": "year", "languages": "language", "audio": "language",
-          "first aired": "year", "release date": "year", "released on": "year", "release": "year", "aired": "year", "genres": "genre", "genre": "genre", "type": "type", "status": "status"}
+          "pixels": "quality", "pixel": "quality", "resolution": "quality", "first aired": "year", "release date": "year", "released on": "year", "release": "year", "aired": "year", "genres": "genre", "genre": "genre", "type": "type", "status": "status"}
 
 LINE_KV = re.compile(r"^\W*([A-Za-z][A-Za-z /&]{1,28}?)\s*(?:[:\u00f7=~\u27a4\u00bb\u2192]|[-\u2013\u2014])\s*(.+)$")
 
@@ -452,7 +452,19 @@ async def on_channel_post(update, context):
         if "name" not in d:
             g = guess_name(msg.caption, d, bool(msg.reply_markup and msg.reply_markup.inline_keyboard))
             if g:
-                d["name"] = g
+                # Pehli line "Lighter and Princess  (S1) (2022)": saal aur season alag nikalo, naam saaf rakho
+                if not d.get("year"):
+                    my_ = re.search(r"\(\s*((?:19|20)\d{2})\s*\)", g)
+                    if my_:
+                        d["year"] = my_.group(1)
+                        g = g.replace(my_.group(0), " ")
+                if not d.get("season"):
+                    ms_ = re.search(r"\(\s*S(\d{1,2})\s*\)|\bSeason\s*(\d{1,2})\b", g, re.I)
+                    if ms_:
+                        d["season"] = ms_.group(1) or ms_.group(2)
+                        g = g.replace(ms_.group(0), " ")
+                g = re.sub(r"\s+", " ", g).strip(" -~|*_")
+                d["name"] = g or d.get("name", "")
         ym = re.search(r"(?:19|20)\d{2}", d.get("year", "") or "")      # "2022-9-9" -> "2022"
         if ym:
             d["year"] = ym.group(0)
@@ -462,6 +474,8 @@ async def on_channel_post(update, context):
             title = d["name"] + (f" ({d['year']})" if d.get("year") else "")
             nums = re.findall(r"\d+", d.get("season", ""))
             dseason = int(nums[0]) if len(nums) == 1 else 0   # "1 - 2" ho to 0 (season file ke naam se aayega)
+            if dseason and not re.search(r"season\s*\d", title, re.I) and "Episode" not in title:
+                title += f" - Season {dseason}"                # "Lighter and Princess (2022) - Season 1"
             if dseason:
                 title += f" - Season {dseason}"
             f = await msg.photo[-1].get_file()
