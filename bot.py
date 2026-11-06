@@ -390,6 +390,31 @@ async def backup_copy(bot, msg):
                 print("Backup copy fail:", cid, type(e).__name__, str(e)[:120])
                 break
 
+async def backup_edit(bot, msg):
+    """Main channel ki post edit hui to backup channel/group ki copy bhi usi tarah badlo (text/caption/buttons)."""
+    try:
+        bmap = db.reference(f"backup/{msg.message_id}").get()
+    except Exception:
+        return
+    if not isinstance(bmap, dict):
+        return                                   # is post ki copy ka ID yaad nahi (purani post)
+    for cid, bm in bmap.items():
+        for attempt in range(3):
+            try:
+                if msg.text is not None:
+                    await bot.edit_message_text(chat_id=int(cid), message_id=int(bm), text=msg.text,
+                                                entities=msg.entities, reply_markup=msg.reply_markup)
+                else:
+                    await bot.edit_message_caption(chat_id=int(cid), message_id=int(bm), caption=msg.caption or "",
+                                                   caption_entities=msg.caption_entities, reply_markup=msg.reply_markup)
+                break
+            except RetryAfter as e:
+                await asyncio.sleep(e.retry_after + 1)
+            except Exception as e:
+                if "not modified" not in str(e).lower():
+                    print("Backup edit fail:", cid, type(e).__name__, str(e)[:100])
+                break
+
 async def on_channel_post(update, context):
     msg = update.channel_post or update.edited_channel_post
     if not msg.chat.username:
@@ -399,6 +424,8 @@ async def on_channel_post(update, context):
         remember_main(msg.chat.id)
     if update.channel_post and BACKUP_IDS and msg.chat.id not in BACKUP_IDS:
         await backup_copy(context.bot, msg)      # nayi post backup channel/group mein bhi
+    elif update.edited_channel_post and BACKUP_IDS and msg.chat.id not in BACKUP_IDS:
+        await backup_edit(context.bot, msg)      # edit hui post backup mein bhi badlo
     base = f"https://t.me/{msg.chat.username}/"
     movies = db.reference("movies")
 
