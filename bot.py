@@ -881,8 +881,15 @@ async def on_setname(update, context):
         if not hit:
             out.append(f"{pid}: app mein file ki tarah nahi mili")
             continue
-        db.reference(f"movies/{hit}/files/{pid}/file").set(new)
-        cap = ("File Name : " + new)[:1024]     # isi format se bot is caption ko dobara padhe to wahi naam rahe
+        fentry = items[hit]["files"][pid] or {}
+        old_label = str(fentry.get("label", ""))
+        lab, sea = make_label(new, int(items[hit].get("season") or 0))        # naye naam se episode/season/quality dobara nikalo
+        oq = re.search(r"(2160|1080|720|480|360)p", old_label, re.I)
+        if oq and not re.search(r"(2160|1080|720|480|360)p", lab, re.I):          # naam mein quality nahi to purani quality rakho
+            lab = ((lab if lab != "Watch" else "") + " " + oq.group(0).lower()).strip()
+        db.reference(f"movies/{hit}/files/{pid}").update({"file": new, "label": lab, "season": sea})
+        extra = f"\nQuality: {oq.group(0).lower()}" if oq and not re.search(r"(2160|1080|720|480|360)p", new, re.I) else ""
+        cap = ("File Name : " + new + extra)[:1024]     # isi format se bot is caption ko dobara padhe to wahi naam/label rahe
         # Main channel ki post ka caption bhi badlo (bot ko channel mein "Edit messages" ka haq chahiye)
         flink = str((items[hit]["files"][pid] or {}).get("link", ""))
         lc = re.search(r"t\.me/c/(\d+)/\d+", flink)                 # private channel: t.me/c/123.../45
@@ -915,7 +922,7 @@ async def on_setname(update, context):
                     print("Backup caption nahi badla:", cid, copy_id, type(e).__name__, str(e)[:100])
             await asyncio.sleep(0.5)
         bk = f" | backup {bok} jagah" + (f", {bfail} nahi" if bfail else "") if bmap else " | backup copy nahi mili"
-        out.append(f"{pid}: {new}{mk}{bk}")
+        out.append(f"{pid}: {new} -> {lab}" + (f" (Season {sea})" if sea else "") + f"{mk}{bk}")
     touch_meta()
     msg = "File ka naam badal diya:\n" + "\n".join(out)
     if bad:
