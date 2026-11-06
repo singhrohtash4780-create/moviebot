@@ -86,8 +86,8 @@ def make_label(text, default_season=0):
 STOP = re.compile(r"[ ._-]*(?:S\d{1,2}E\d|S\d{1,2}(?![A-Za-z])|Season|(?<![A-Za-z])E\d{1,3}(?!\d)|(?:19|20)\d{2}|2160p|1080p|720p|480p|360p)", re.I)
 
 # Naam ke shuru ka site ka tag: "(Movies4u.Bid).", "[1TamilMV] -", "www.site.com -" (movie ka naam nahi hota)
-LEAD_TAG = re.compile(r"^\s*(?:[\(\[\{][^\)\]\}]*[A-Za-z][^\)\]\}]*[\)\]\}]|www\.[A-Za-z0-9-]+\.[A-Za-z]{2,}"
-                      r"|[A-Za-z0-9-]+\.(?:com|net|org|in|me|tv|bid|xyz|to|cc|lol|site|club|live)(?![A-Za-z0-9]))[\s._-]*", re.I)
+LEAD_TAG = re.compile(r"^\s*(?:[\(\[\{][^\)\]\}]*[A-Za-z][^\)\]\}]*[\)\]\}]|www\.[A-Za-z0-9-]+\.[A-Za-z]{2,}|@[A-Za-z0-9_]{3,}"
+                      r"|[A-Za-z0-9-]+\.(?:com|net|org|in|me|tv|bid|xyz|to|cc|lol|site|club|live)(?![A-Za-z0-9]))[\s._|-]*", re.I)
 
 def strip_tag(s):
     s = s or ""
@@ -477,8 +477,6 @@ async def on_channel_post(update, context):
             dseason = int(nums[0]) if len(nums) == 1 else 0   # "1 - 2" ho to 0 (season file ke naam se aayega)
             if dseason and not re.search(r"season\s*\d", title, re.I) and "Episode" not in title:
                 title += f" - Season {dseason}"                # "Lighter and Princess (2022) - Season 1"
-            if dseason:
-                title += f" - Season {dseason}"
             f = await msg.photo[-1].get_file()
             img = Image.open(io.BytesIO(bytes(await f.download_as_bytearray())))
             poster = make_poster(img)
