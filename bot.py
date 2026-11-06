@@ -777,26 +777,69 @@ async def on_setlogo(update, context):
     await update.message.reply_text("Logo badal diya. App mein 3 minute ke andar dikhega.")
 
 async def on_alias(update, context):
-    # /alias https://t.me/channel/57 Jannat 2  -> "Jannat 2" naam ki files bhi us poster wale card mein aayen
+    # /alias POSTER_LINK Jannat 2, Jannat 3   -> in naamo ki files bhi us poster wale card mein aayengi
+    # /alias POSTER_LINK 2720-2735            -> in file posts (range ya link) ko seedha us card mein le aao
     if not await admin_ok(update):
         return
     mt = re.search(r"/(\d+)\s*$", context.args[0]) if context.args else None
-    name = " ".join(context.args[1:]).strip()
-    if not mt or not title_key(name):
-        await update.message.reply_text("Aise likho: /alias https://t.me/tumhara_channel/57 Jannat 2\n(link poster post ka, uske baad wo naam jiski files is card mein chahiye)")
+    rest = " ".join(context.args[1:]).strip()
+    if not mt or not rest:
+        await update.message.reply_text("Aise likho:\n/alias https://t.me/tumhara_channel/57 Jannat 2, Jannat 3\n(poster ka link, phir wo naam jinki files is card mein chahiye; kai naam comma se)\n\n"
+                                        "/alias https://t.me/tumhara_channel/57 2720-2735\n(poster ka link, phir file posts ka range ya link: wo files is card mein aa jayengi)")
         return
-    ref = db.reference(f"movies/{mt.group(1)}")
+    global NAMES
+    pid = mt.group(1)
+    ref = db.reference(f"movies/{pid}")
     card = ref.get()
     if not card:
         await update.message.reply_text("Ye poster post app mein nahi mili.")
         return
+
+    # ---- file posts ka range / link ----
+    if re.fullmatch(r"(?:https?://\S+/)?\d+\s*[-\u2013]\s*\d+|https?://t\.me/\S+/\d+", rest):
+        ids, err = parse_ids(rest)
+        if err:
+            await update.message.reply_text(err if err != "format" else "Range aise likho: 2720-2735 ya https://t.me/channel/2720-2735")
+            return
+        data = db.reference("movies").get() or {}
+        items = {str(k): v for k, v in (data.items() if isinstance(data, dict) else enumerate(data)) if v}
+        moved, miss, emptied = 0, 0, 0
+        for fid in ids:
+            if fid == pid:
+                continue
+            src = next((k for k, v in items.items() if k != pid and fid in (v.get("files") or {})), None)
+            if not src:
+                if fid in (items[pid].get("files") or {}):
+                    continue                      # pehle se isi card mein hai
+                miss += 1
+                continue
+            entry = items[src]["files"].pop(fid)
+            db.reference(f"movies/{pid}/files/{fid}").set(entry)
+            db.reference(f"movies/{src}/files/{fid}").delete()
+            moved += 1
+            if not items[src]["files"] and not (items[src].get("pcard") or items[src].get("poster") is True or items[src].get("language") or items[src].get("quality") or items[src].get("format")):
+                for path in (f"movies/{src}", f"posters/{src}", f"index/{src}"):      # khali bina-poster card hata do
+                    db.reference(path).delete()
+                emptied += 1
+        NAMES = None
+        touch_meta()
+        await update.message.reply_text(f"{moved} file is card mein le aayi." + (f"\n{miss} post app mein file ki tarah nahi mili." if miss else "")
+                                        + (f"\n{emptied} khali faltu card hata diya." if emptied else "") + "\nApp mein 3 minute ke andar badal jayega.")
+        return
+
+    # ---- naam (kai naam comma se) ----
+    names = [n.strip() for n in rest.split(",") if title_key(n.strip())]
+    if not names:
+        await update.message.reply_text("Naam samajh nahi aaya. Aise likho: /alias POSTER_LINK Jannat 2, Jannat 3")
+        return
     al = card.get("alias") or []
     al = list(al.values()) if isinstance(al, dict) else list(al)
-    if name not in al:
-        al.append(name)
+    for name in names:
+        if name not in al:
+            al.append(name)
     ref.child("alias").set(al)
     n = merge_autos()
-    await update.message.reply_text(f"Ab '{name}' ki files is card mein aayengi. {n} purana card mila diya.\nApp mein 3 minute ke andar badal jayega.")
+    await update.message.reply_text(f"Ab {', '.join(repr(x) for x in names)} ki files is card mein aayengi. {n} purana card mila diya.\nApp mein 3 minute ke andar badal jayega.")
 
 async def on_help(update, context):
     if not await admin_ok(update):
@@ -811,7 +854,8 @@ async def on_help(update, context):
         "/remove POST_LINK - sirf APP se hatao (range: /remove LINK/40-50)\n"
         "/delete POST_LINK - APP, CHANNEL aur BACKUP, teeno se hatao (range: /delete LINK/40-50)\n"
         "/merge - bina-poster wale faltu cards ko poster wale card mein milao\n"
-        "/alias POSTER_LINK Naam - doosre naam ki files bhi us card mein lao (jaise Jannat 2)\n"
+        "/alias POSTER_LINK Naam1, Naam2 - doosre naam ki files bhi us card mein lao (jaise Jannat 2)\n"
+        "/alias POSTER_LINK 2720-2735 - in file posts (range ya link) ko seedha us card mein le aao\n"
         "/setq FILE_POST_LINK 480p - file ki quality haath se set karo (label \"Watch\" ho to)\n"
         "/setname LINK Naya.Naam.mkv - file ka naam badlo (kai file: har line mein LINK aur naam)\n"
         "/pin POST_LINK ya movie ka naam - movie ko website par sabse upar pin karo\n"
