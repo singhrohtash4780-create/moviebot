@@ -363,6 +363,14 @@ def is_duplicate_file(target, msg_id, uid, fname, size):
             return fid
     return None
 
+async def tell_admin(bot, text):
+    # File add na hone ki wajah admin ko private chat mein bhejo (taaki Logs na dekhne pade)
+    try:
+        if ADMIN_ID:
+            await bot.send_message(chat_id=ADMIN_ID, text=text[:3500], disable_web_page_preview=True)
+    except Exception as e:
+        print("Admin ko batana nahi ho paya:", type(e).__name__)
+
 def mb(n):
     if not n:
         return ""
@@ -608,6 +616,7 @@ async def on_channel_post(update, context):
         index_set(msg.message_id, {"title": title, "quality": "", "date": msg.date.isoformat()})
         target, cseason = msg.message_id, 0
         print("Nayi card bani:", title)
+        await tell_admin(context.bot, f"Is file ke liye NAYI card bani (kisi poster wali card se naam nahi mila):\n{title}\nFile: {name or first}\n{base}{msg.message_id}\nSahi card mein lane ke liye: /alias POSTER_LINK {title}")
 
     if target:
         label, season = make_label(name + " " + caption, cseason)
@@ -615,6 +624,7 @@ async def on_channel_post(update, context):
         dup = is_duplicate_file(target, msg.message_id, uid, name or first, mb(media.file_size))
         if dup:
             print("Pehle se judi hai, dobara nahi jodi:", label, "(post", dup, ")")
+            await tell_admin(context.bot, f"File add NAHI hui: wahi file (same file_unique_id) is card mein pehle se judi hai.\nNai post: {base}{msg.message_id}\nPehle wali post: {base}{dup}\nLabel: {label}")
             return
         heads, n = [], msg.message_id - 1
         while len(heads) < 3 and db.reference(f"heads/{n}").get():
@@ -630,6 +640,7 @@ async def on_channel_post(update, context):
         return
 
     print("Chhodi gayi: file ka naam ya caption nahi mila ->", name)
+    await tell_admin(context.bot, f"File add NAHI hui: movie ka naam nahi mila aur koi card bhi nahi mila.\nFile: {name or first}\n{base}{msg.message_id}\nCaption mein 'Title: ...' ya 'File Name : ...' likho, ya poster ke baad bhejo.")
 
 
 async def safe_copy(bot, chat_id, user, num, caption=None):
@@ -802,14 +813,20 @@ async def on_setq(update, context):
     a = context.args
     pairs = []
     for i in range(0, len(a) - 1, 2):
-        mid = re.search(r"(\d+)\s*$", a[i])
         qm = re.fullmatch(r"(2160|1080|720|480|360)p?", a[i + 1].strip(), re.I)
-        if mid and qm:
+        rg = re.search(r"(\d+)\s*[-\u2013]\s*(\d+)\s*$", a[i])         # range: LINK/2720-2735
+        mid = re.search(r"(\d+)\s*$", a[i])
+        if not qm:
+            continue
+        if rg and 0 <= int(rg.group(2)) - int(rg.group(1)) <= 300:
+            pairs += [(str(n), qm.group(1) + "p") for n in range(int(rg.group(1)), int(rg.group(2)) + 1)]
+        elif mid:
             pairs.append((mid.group(1), qm.group(1) + "p"))
     if not pairs or len(a) % 2:
         await update.message.reply_text("Aise likho (file wali post ka link, phir quality):\n"
                                         "/setq https://t.me/tumhara_channel/2720 480p\n"
-                                        "Ek saath kai: /setq LINK1 480p LINK2 720p LINK3 1080p")
+                                        "Kai file, alag quality: /setq LINK1 480p LINK2 720p LINK3 1080p\n"
+                                        "Lagatar posts, ek hi quality: /setq https://t.me/tumhara_channel/2720-2735 720p")
         return
     data = db.reference("movies").get() or {}
     items = {str(k): v for k, v in (data.items() if isinstance(data, dict) else enumerate(data)) if v}
@@ -828,9 +845,9 @@ async def on_setq(update, context):
         done.append(f"{pid} -> {label}")
     if done:
         touch_meta()
-    msg = ("Label badal diye:\n" + "\n".join(done)) if done else "Koi file nahi mili."
+    msg = (f"{len(done)} file ka label badal diya:\n" + "\n".join(done[:15]) + (f"\n... aur {len(done) - 15}" if len(done) > 15 else "")) if done else "Koi file nahi mili."
     if miss:
-        msg += "\nYe post app mein file ki tarah nahi mili: " + ", ".join(miss)
+        msg += f"\n{len(miss)} post app mein file ki tarah nahi mili (poster/head post ho sakti hai): " + ", ".join(miss[:10]) + (" ..." if len(miss) > 10 else "")
     await update.message.reply_text(msg + ("\nApp mein 3 minute ke andar badal jayega." if done else ""))
 
 async def on_setname(update, context):
