@@ -882,11 +882,30 @@ async def on_setname(update, context):
             out.append(f"{pid}: app mein file ki tarah nahi mili")
             continue
         db.reference(f"movies/{hit}/files/{pid}/file").set(new)
+        cap = ("File Name : " + new)[:1024]     # isi format se bot is caption ko dobara padhe to wahi naam rahe
+        # Main channel ki post ka caption bhi badlo (bot ko channel mein "Edit messages" ka haq chahiye)
+        flink = str((items[hit]["files"][pid] or {}).get("link", ""))
+        lc = re.search(r"t\.me/c/(\d+)/\d+", flink)                 # private channel: t.me/c/123.../45
+        lk = re.search(r"t\.me/([A-Za-z0-9_]+)/\d+", flink)
+        main_chat = int("-100" + lc.group(1)) if lc else (("@" + lk.group(1)) if lk else MAIN_CHAT)
+        mk = ""
+        if main_chat:
+            try:
+                await context.bot.edit_message_caption(chat_id=main_chat, message_id=int(pid), caption=cap)
+                mk = " | channel badla"
+            except Exception as e:
+                if "not modified" in str(e).lower():
+                    mk = " | channel badla"
+                else:
+                    mk = " | channel NAHI badla (" + type(e).__name__ + ": " + str(e)[:60] + ")"
+                    print("Main caption nahi badla:", pid, type(e).__name__, str(e)[:100])
+        else:
+            mk = " | channel ka link nahi mila"
         bmap = db.reference(f"backup/{pid}").get() or {}
         bok = bfail = 0
         for cid, copy_id in (bmap.items() if isinstance(bmap, dict) else []):
             try:
-                await context.bot.edit_message_caption(chat_id=int(cid), message_id=int(copy_id), caption=new[:1024])
+                await context.bot.edit_message_caption(chat_id=int(cid), message_id=int(copy_id), caption=cap)
                 bok += 1
             except Exception as e:
                 if "not modified" in str(e).lower():
@@ -896,7 +915,7 @@ async def on_setname(update, context):
                     print("Backup caption nahi badla:", cid, copy_id, type(e).__name__, str(e)[:100])
             await asyncio.sleep(0.5)
         bk = f" | backup {bok} jagah" + (f", {bfail} nahi" if bfail else "") if bmap else " | backup copy nahi mili"
-        out.append(f"{pid}: {new}{bk}")
+        out.append(f"{pid}: {new}{mk}{bk}")
     touch_meta()
     msg = "File ka naam badal diya:\n" + "\n".join(out)
     if bad:
