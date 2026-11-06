@@ -8,6 +8,7 @@ from telegram import BotCommand, BotCommandScopeChat
 from telegram.ext import Application, MessageHandler, CommandHandler, filters
 from PIL import Image, ImageFilter, ImageOps
 from telegram.error import RetryAfter
+from types import SimpleNamespace
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 DB_URL = os.environ["DB_URL"]
@@ -816,6 +817,7 @@ async def on_help(update, context):
         "/pin POST_LINK ya movie ka naam - movie ko website par sabse upar pin karo\n"
         "/unpin POST_LINK ya naam - pin hatao\n"
         "/pins - pin ki hui movies ki list\n"
+        "Manual add: channel ki poster ya file wali post bot ki private chat mein FORWARD karo, bot use app mein jod dega\n"
         "/rebuildindex - app ke liye halka index banao (purani movies ke liye ek baar)\n"
         "/help - ye list\n\n"
         "Auto tareeka: poster ke caption mein ek line likho  Also: Jannat 2, Jannat 3  to un naamo ki files apne aap us card mein aayengi.")
@@ -942,6 +944,50 @@ async def on_setname(update, context):
     if bad:
         msg += "\n\nYe line samajh nahi aayi: " + "; ".join(bad)
     await update.message.reply_text(msg)
+
+class _Fwd:
+    """Bot ki private chat mein forward ki gayi channel post ko aise dikhao jaise wo channel mein hi aayi ho (asli post ID aur channel ke saath)."""
+    def __init__(self, m, chat, message_id):
+        self._m = m
+        self.chat = chat
+        self.message_id = message_id
+    def __getattr__(self, name):
+        return getattr(self._m, name)
+
+async def on_forwarded(update, context):
+    # Admin channel ki poster ya file post bot ko forward kare: bot use manual tareeke se card/file ki tarah add kar deta hai
+    m = update.message
+    if not m or not update.effective_user or update.effective_user.id != ADMIN_ID:
+        return
+    o = getattr(m, "forward_origin", None)
+    ch, mid = getattr(o, "chat", None), getattr(o, "message_id", None)
+    if not ch or not mid or not getattr(ch, "username", None):
+        await m.reply_text("Ye post channel se forward hui nahi dikhti, ya channel public nahi hai (username chahiye). "
+                           "Channel se seedha forward karo, \"forward\" ka naam chhupa hua na ho.")
+        return
+    if not (m.photo or m.document or m.video or m.audio):
+        await m.reply_text("Poster (photo + caption) ya file wali post forward karo.")
+        return
+    fwd = _Fwd(m, ch, int(mid))
+    try:
+        await on_channel_post(SimpleNamespace(channel_post=None, edited_channel_post=fwd), context)
+    except Exception as e:
+        await m.reply_text("Add karte waqt error aaya: " + type(e).__name__ + " - " + str(e)[:150])
+        return
+    link = f"https://t.me/{ch.username}/{mid}"
+    if m.photo and m.caption:
+        t = db.reference(f"movies/{mid}/title").get()
+        await m.reply_text(f"Card ban gayi: {t}\n{link}\nApp mein 3 minute ke andar dikhegi." if t else
+                           f"Card nahi bani: caption ka format samajh nahi aaya.\n{link}\nCaption mein naam aur language/quality jaisi koi detail honi chahiye (ya `Movie Name: ...`).")
+        return
+    data = db.reference("movies").get() or {}
+    items = {str(k): v for k, v in (data.items() if isinstance(data, dict) else enumerate(data)) if v}
+    hit = next(((k, v) for k, v in items.items() if str(mid) in (v.get("files") or {})), None)
+    if hit:
+        f = hit[1]["files"][str(mid)] or {}
+        await m.reply_text(f"File judi: {hit[1].get('title', '')}\nLabel: {f.get('label', '')}\n{link}")
+    else:
+        await m.reply_text(f"File nahi judi.\n{link}\nWajah upar wale message mein hogi, ya caption mein `File Name : ...` ya `Title: ...` likh kar dobara forward karo.")
 
 async def on_rebuildindex(update, context):
     # /rebuildindex -> purani saari movies ka halka index ek baar mein banao (naya app chalane se pehle ek baar)
@@ -1300,6 +1346,7 @@ app.add_handler(CommandHandler("setname", on_setname))
 app.add_handler(CommandHandler("help", on_help))
 app.add_error_handler(on_error)
 app.add_handler(MessageHandler(filters.PHOTO & filters.CaptionRegex(r"^/setlogo") & filters.ChatType.PRIVATE, on_setlogo))
+app.add_handler(MessageHandler(filters.FORWARDED & filters.ChatType.PRIVATE & ~filters.COMMAND, on_forwarded))
 app.add_handler(MessageHandler(filters.UpdateType.CHANNEL_POST | filters.UpdateType.EDITED_CHANNEL_POST, on_channel_post))
 try:
     app.run_polling(allowed_updates=["channel_post", "edited_channel_post", "message"])
