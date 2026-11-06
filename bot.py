@@ -24,20 +24,28 @@ FIELDS = {"movie name": "name", "series name": "name", "release year": "year",
           "released year": "year", "language": "language", "quality": "quality",
           "format": "format", "season": "season", "episode": "episode",
           "year": "year", "released": "year", "languages": "language", "audio": "language",
-          "first aired": "year", "aired": "year", "genres": "genre", "genre": "genre", "type": "type", "status": "status"}
+          "first aired": "year", "release date": "year", "released on": "year", "release": "year", "aired": "year", "genres": "genre", "genre": "genre", "type": "type", "status": "status"}
+
+LINE_KV = re.compile(r"^\W*([A-Za-z][A-Za-z /&]{1,28}?)\s*(?:[:\u00f7=~\u27a4\u00bb\u2192]|[-\u2013\u2014])\s*(.+)$")
 
 def parse_details(text):
+    """Caption ki 'Key: value' lines padho. Separator : ya ÷ ya - ya ~ chalega; shuru ke emoji/symbol hat jate hain."""
     out = {}
     for line in (text or "").splitlines():
-        if ":" in line:
-            k, v = line.split(":", 1)
-            k = re.sub(r"^[\W_]+", "", re.sub(r"\s+", " ", k.strip().lower()))   # shuru ke emoji/symbol hatao
-            if k in FIELDS:
-                out[FIELDS[k]] = v.strip()
-            elif k in ("also", "also includes", "includes", "alias", "also known as"):
-                out["alias"] = [x.strip() for x in re.split(r"[,/|]", v) if x.strip()]    # Also: Jannat 2, Jannat 3
-            elif re.fullmatch(r"(full |movie |series |film |drama |show |serial )?(name|title)", k):
-                out["name"] = v.strip()      # Full Name / Name / Title / Drama Name ...
+        m = LINE_KV.match(line.strip())
+        if not m:
+            continue
+        k = re.sub(r"\s+", " ", m.group(1).strip().lower())
+        raw = m.group(2).strip()
+        v = re.sub(r"\s*#\w+", "", raw).strip(" |")          # #Official jaise tag hatao
+        if not v:
+            continue
+        if k in FIELDS:
+            out[FIELDS[k]] = v
+        elif k in ("also", "also includes", "includes", "alias", "also known as"):
+            out["alias"] = [x.strip() for x in re.split(r"[,/|]", raw) if x.strip()]    # Also: Jannat 2, Jannat 3
+        elif re.fullmatch(r"(file |full |movie |series |film |drama |show |serial |anime )?(name|title)", k):
+            out["name"] = raw.strip(" |")      # File Name / Full Name / Name / Title / Drama Name ...
     return out
 
 def guess_name(text, d, has_buttons):
@@ -49,6 +57,8 @@ def guess_name(text, d, has_buttons):
     name = re.sub(r"^[\W_]+", "", lines[0]).strip(" -~|*_")
     if len(name) < 2:
         return None
+    if name.isupper():
+        name = name.title()           # VOICEMAILS FOR ISABELLE -> Voicemails For Isabelle
     looks_like_post = has_buttons or any(k in d for k in ("language", "format", "quality", "year", "season", "episode", "genre", "type"))
     return name if looks_like_post else None
 
