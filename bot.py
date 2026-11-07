@@ -1,6 +1,6 @@
 # Telegram channel -> Firebase Realtime Database
 # pip install python-telegram-bot firebase-admin pillow
-import os, io, re, json, uuid, socket, base64, asyncio, time, threading
+import os, io, re, json, unicodedata, uuid, socket, base64, asyncio, time, threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import firebase_admin
 from firebase_admin import credentials, db
@@ -27,12 +27,17 @@ FIELDS = {"movie name": "name", "series name": "name", "release year": "year",
           "year": "year", "released": "year", "languages": "language", "audio": "language",
           "pixels": "quality", "pixel": "quality", "resolution": "quality", "first aired": "year", "release date": "year", "released on": "year", "release": "year", "aired": "year", "genres": "genre", "genre": "genre", "type": "type", "status": "status"}
 
-LINE_KV = re.compile(r"^\W*([A-Za-z][A-Za-z /&]{1,28}?)\s*(?:[:\u00f7=~\u27a4\u00bb\u2192]|[-\u2013\u2014])\s*(.+)$")
+LINE_KV = re.compile(r"^\W*([A-Za-z][A-Za-z /&]{1,28}?)\s*(?:[:\u00f7=~\u27a4\u00bb\u2192]|[-\u2013\u2014]|[^\w\s]{1,3})\s*(.+)$")
+
+def clean_text(text):
+    """Styled/fullwidth akshar (\U0001d5e6\U0001d5d8 \uff1a) ko saaf ASCII banao aur chhupe (zero-width) akshar hatao, taaki Key: value pehchani jaye."""
+    t = unicodedata.normalize("NFKC", text or "")
+    return re.sub(r"[\u200b-\u200f\u202a-\u202e\u2060\ufeff]", "", t)
 
 def parse_details(text):
     """Caption ki 'Key: value' lines padho. Separator : ya ÷ ya - ya ~ chalega; shuru ke emoji/symbol hat jate hain."""
     out = {}
-    for line in (text or "").splitlines():
+    for line in clean_text(text).splitlines():
         m = LINE_KV.match(line.strip())
         if not m:
             continue
@@ -52,7 +57,7 @@ def parse_details(text):
 def guess_name(text, d, has_buttons):
     """Caption mein 'Name:' nahi: pehli line (emoji hata kar) ko naam maano, par tabhi jab post movie-post jaisi ho
     (language/format/quality/year jaisi koi detail ya neeche quality ke button hon)."""
-    lines = [l.strip() for l in (text or "").splitlines() if l.strip()]
+    lines = [l.strip() for l in clean_text(text).splitlines() if l.strip()]
     if not lines or ":" in lines[0]:
         return None
     name = re.sub(r"^[\W_]+", "", lines[0]).strip(" -~|*_")
@@ -583,6 +588,7 @@ async def on_channel_post(update, context):
             await tell_admin(context.bot, "Ye poster post CARD NAHI bani (naam samajh nahi aaya):\n" + base + str(msg.message_id)
                              + "\nPehli line: " + (msg.caption.strip().splitlines()[0][:80])
                              + "\nBot ne ye details padhi: " + (", ".join(dd.keys()) or "koi nahi")
+                             + "\nCaption ki line 1-3 (code ke saath, jaanch ke liye): " + ascii([l.strip()[:45] for l in msg.caption.splitlines() if l.strip()][:3])
                              + "\nFix: caption mein 'Movie Name: ...' ya 'Series Name: ...' likho, ya pehli line sirf naam rakho, phir caption edit karo.")
         db.reference("heads").child(str(msg.message_id)).set(True)
         print("Header post yaad rakhi:", msg.message_id)
@@ -1279,6 +1285,12 @@ async def on_error(update, context):
     try:      # admin ko chat mein bhi dikhao, taaki command chup na lage
         if update and getattr(update, "message", None) and update.effective_user and update.effective_user.id == ADMIN_ID:
             await update.message.reply_text("Error: " + type(err).__name__ + " - " + str(err)[:200])
+        else:
+            post = getattr(update, "channel_post", None) or getattr(update, "edited_channel_post", None)
+            if post is not None and ADMIN_ID:     # channel post process karte waqt error: chup mat raho
+                link = f"https://t.me/{post.chat.username}/{post.message_id}" if getattr(post.chat, "username", None) else str(post.message_id)
+                await context.bot.send_message(chat_id=ADMIN_ID, disable_web_page_preview=True,
+                                               text=f"Is post ko process karte waqt ERROR aaya, isliye add nahi hui:\n{link}\n{type(err).__name__}: {str(err)[:300]}")
     except Exception:
         pass
 
