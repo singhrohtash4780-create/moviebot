@@ -77,35 +77,79 @@ def guess_name(text, d, has_buttons):
 LANG_WORDS = ["Hindi", "English", "Korean", "Chinese", "Japanese", "Tamil", "Telugu", "Malayalam", "Kannada", "Bengali",
               "Urdu", "Punjabi", "Marathi", "Thai", "Turkish", "Spanish", "French", "Indonesian"]
 
+def _u16_idx(s, off):
+    """Telegram ka offset UTF-16 units mein hota hai; Python string ka index nikalo."""
+    idx = units = 0
+    for ch in s:
+        if units >= off:
+            break
+        units += 2 if ord(ch) > 0xFFFF else 1
+        idx += 1
+    return idx
+
 def parse_link_post(text, entities=None):
     """Aise poster jinme files channel mein nahi, quality ke saamne download links hote hain:
-       'My Unicorn Girl S01[2020]'  ...  '480p (170MB/Ep): https://...'   ->  naam, season, saal, language, [(quality, link, size)]"""
-    lines = [l.strip() for l in clean_text(text).splitlines() if l.strip()]
+       'My Unicorn Girl S01[2020]'  ...  '480p (170MB/Ep): https://...'   ->  naam, season, saal, language, [(quality, link, size)]
+       Link seedha likha ho ya text ke peeche chhupa (text_link) ho, dono chalte hain."""
+    raw = text or ""
+    lines = [l.strip() for l in clean_text(raw).splitlines() if l.strip()]
     name = year = season = None
+    strong = False
     for l in lines:
         if l.lower().startswith("join") or re.search(r"https?://", l):
             continue
         body = re.sub(r"^[^A-Za-z0-9]+", "", l)
-        m = (re.search(r"^(.+?)\s+S(\d{1,2})\s*[\u3010\[\(]\s*((?:19|20)\d{2})\s*[\u3011\]\)]", body)
-             or re.search(r"^(.+?)\s+S(\d{1,2})\b", body))
+        m = re.search(r"^(.+?)\s+S(\d{1,2})\s*[\u3010\[\(]\s*((?:19|20)\d{2})\s*[\u3011\]\)]", body)
+        if m:
+            strong = True
+        else:
+            m = re.search(r"^(.+?)\s+S(\d{1,2})\b", body)
         if m:
             name, season = m.group(1).strip(" -~|*_:"), int(m.group(2))
             year = m.group(3) if m.lastindex and m.lastindex >= 3 else None
             break
     if not name or len(name) < 2:
         return None
+
+    def size_of(line):
+        sz = re.search(r"\(\s*([\d.]+\s*[MG]B)\s*(?:/\s*Ep\w*)?\s*\)", line, re.I)
+        return re.sub(r"\s+", "", sz.group(1)) + "/ep" if sz else ""
+
     items, cur = [], None
-    for l in lines:
+    for l in lines:                                              # seedhe likhe links
         q = re.search(r"(2160|1080|720|480|360)p", l, re.I)
         u = re.search(r"https?://[^\s\u3000]+", l)
         if q:
-            sz = re.search(r"\(\s*([\d.]+\s*[MG]B)\s*(?:/\s*Ep\w*)?\s*\)", l, re.I)
-            cur = [q.group(1).lower() + "p", re.sub(r"\s+", "", sz.group(1)) + "/ep" if sz else "", None]
+            cur = [q.group(1).lower() + "p", size_of(l), None]
             items.append(cur)
         if u and cur and cur[2] is None:
             cur[2] = u.group(0).rstrip(").,;:")
     items = [(q, u, sz) for q, sz, u in items if u]
-    if not items:
+    have = {u for _, u, _ in items}
+    raw_lines = raw.split("\n")
+    starts, pos = [], 0
+    for rl in raw_lines:
+        starts.append(pos)
+        pos += len(rl) + 1
+    for e in (entities or []):                                   # text ke peeche chhupe links
+        url = getattr(e, "url", None)
+        if not url or getattr(e, "type", "") != "text_link" or url in have or not re.match(r"https?://", url):
+            continue
+        i0 = _u16_idx(raw, e.offset)
+        li = max(k for k, st in enumerate(starts) if st <= i0)
+        q = sz = None
+        for back in range(0, 3):                                 # isi line ya upar ki 2 line mein quality dhundo
+            if li - back < 0:
+                break
+            ln = clean_text(raw_lines[li - back])
+            qm = re.search(r"(2160|1080|720|480|360)p", ln, re.I)
+            if qm:
+                q, sz = qm.group(1).lower() + "p", size_of(ln)
+                break
+        if q:
+            items.append((q, url, sz or ""))
+            have.add(url)
+    if not items and not strong:
         return None
     langs, seen = [], set()
     for l in lines:
@@ -532,7 +576,8 @@ async def on_channel_post(update, context):
                 d["season"] = str(lp["season"])
                 if lp["language"]:
                     d["language"] = lp["language"]
-                d["quality"] = " | ".join(q for q, _, _ in lp["files"])
+                if lp["files"]:
+                    d["quality"] = " | ".join(dict.fromkeys(q for q, _, _ in lp["files"]))
                 lfiles = lp["files"]
         ym = re.search(r"(?:19|20)\d{2}", d.get("year", "") or "")      # "2022-9-9" -> "2022"
         if ym:
@@ -660,6 +705,9 @@ async def on_channel_post(update, context):
             await tell_admin(context.bot, "Ye poster post CARD NAHI bani (naam samajh nahi aaya):\n" + base + str(msg.message_id)
                              + "\nPehli line: " + (msg.caption.strip().splitlines()[0][:80])
                              + "\nBot ne ye details padhi: " + (", ".join(dd.keys()) or "koi nahi")
+                             + "\nLinks: " + (", ".join(sorted({e.type for e in (msg.caption_entities or [])})) or "koi entity nahi")
+                             + (" | text_link: " + str(sum(1 for e in (msg.caption_entities or []) if e.type == "text_link")))
+                             + (" | buttons: " + str(sum(len(r) for r in msg.reply_markup.inline_keyboard)) if msg.reply_markup else "")
                              + "\nCaption ki line 1-3 (code ke saath, jaanch ke liye): " + ascii([l.strip()[:45] for l in msg.caption.splitlines() if l.strip()][:3])
                              + "\nFix: caption mein 'Movie Name: ...' ya 'Series Name: ...' likho, ya pehli line sirf naam rakho, phir caption edit karo.")
         db.reference("heads").child(str(msg.message_id)).set(True)
