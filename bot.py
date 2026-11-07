@@ -56,6 +56,12 @@ def guess_name(text, d, has_buttons):
     if not lines or ":" in lines[0]:
         return None
     name = re.sub(r"^[\W_]+", "", lines[0]).strip(" -~|*_")
+    name = re.sub(r"[^\w\)\]!?.\"']+$", "", name)           # aakhir ke emoji/symbol hatao ("Filing For Love \U0001f496")
+    if re.search(r"\|", name):                              # "Drama || Filing For Love": category ka shabd hata kar asli naam rakho
+        parts = [x.strip() for x in re.split(r"\s*\|+\s*", name) if x.strip()]
+        cat = {"drama", "dramas", "movie", "movies", "film", "series", "web series", "tv series", "tv show", "show", "serial", "anime", "kdrama", "k-drama", "cdrama", "c-drama"}
+        keep = [x for x in parts if x.lower() not in cat]
+        name = max(keep, key=len) if keep else (parts[-1] if parts else name)
     if len(name) < 2:
         return None
     if name.isupper():
@@ -477,6 +483,8 @@ async def on_channel_post(update, context):
             dseason = int(nums[0]) if len(nums) == 1 else 0   # "1 - 2" ho to 0 (season file ke naam se aayega)
             if dseason and not re.search(r"season\s*\d", title, re.I) and "Episode" not in title:
                 title += f" - Season {dseason}"                # "Lighter and Princess (2022) - Season 1"
+            if dseason:
+                title += f" - Season {dseason}"
             f = await msg.photo[-1].get_file()
             img = Image.open(io.BytesIO(bytes(await f.download_as_bytearray())))
             poster = make_poster(img)
@@ -569,6 +577,13 @@ async def on_channel_post(update, context):
 
     # Header post: sticker / animation / bina details wali photo (jaise "1080P", "SEASON 02")
     if msg.sticker or msg.animation or msg.photo:
+        if msg.photo and len([l for l in (msg.caption or "").splitlines() if l.strip()]) >= 3:
+            # lambi caption wali photo header nahi, poster hoti hai: card kyun nahi bani, admin ko batao
+            dd = parse_details(msg.caption)
+            await tell_admin(context.bot, "Ye poster post CARD NAHI bani (naam samajh nahi aaya):\n" + base + str(msg.message_id)
+                             + "\nPehli line: " + (msg.caption.strip().splitlines()[0][:80])
+                             + "\nBot ne ye details padhi: " + (", ".join(dd.keys()) or "koi nahi")
+                             + "\nFix: caption mein 'Movie Name: ...' ya 'Series Name: ...' likho, ya pehli line sirf naam rakho, phir caption edit karo.")
         db.reference("heads").child(str(msg.message_id)).set(True)
         print("Header post yaad rakhi:", msg.message_id)
         return
