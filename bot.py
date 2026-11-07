@@ -74,6 +74,49 @@ def guess_name(text, d, has_buttons):
     looks_like_post = has_buttons or any(k in d for k in ("language", "format", "quality", "year", "season", "episode", "genre", "type"))
     return name if looks_like_post else None
 
+LANG_WORDS = ["Hindi", "English", "Korean", "Chinese", "Japanese", "Tamil", "Telugu", "Malayalam", "Kannada", "Bengali",
+              "Urdu", "Punjabi", "Marathi", "Thai", "Turkish", "Spanish", "French", "Indonesian"]
+
+def parse_link_post(text, entities=None):
+    """Aise poster jinme files channel mein nahi, quality ke saamne download links hote hain:
+       'My Unicorn Girl S01[2020]'  ...  '480p (170MB/Ep): https://...'   ->  naam, season, saal, language, [(quality, link, size)]"""
+    lines = [l.strip() for l in clean_text(text).splitlines() if l.strip()]
+    name = year = season = None
+    for l in lines:
+        if l.lower().startswith("join") or re.search(r"https?://", l):
+            continue
+        body = re.sub(r"^[^A-Za-z0-9]+", "", l)
+        m = (re.search(r"^(.+?)\s+S(\d{1,2})\s*[\u3010\[\(]\s*((?:19|20)\d{2})\s*[\u3011\]\)]", body)
+             or re.search(r"^(.+?)\s+S(\d{1,2})\b", body))
+        if m:
+            name, season = m.group(1).strip(" -~|*_:"), int(m.group(2))
+            year = m.group(3) if m.lastindex and m.lastindex >= 3 else None
+            break
+    if not name or len(name) < 2:
+        return None
+    items, cur = [], None
+    for l in lines:
+        q = re.search(r"(2160|1080|720|480|360)p", l, re.I)
+        u = re.search(r"https?://[^\s\u3000]+", l)
+        if q:
+            sz = re.search(r"\(\s*([\d.]+\s*[MG]B)\s*(?:/\s*Ep\w*)?\s*\)", l, re.I)
+            cur = [q.group(1).lower() + "p", re.sub(r"\s+", "", sz.group(1)) + "/ep" if sz else "", None]
+            items.append(cur)
+        if u and cur and cur[2] is None:
+            cur[2] = u.group(0).rstrip(").,;:")
+    items = [(q, u, sz) for q, sz, u in items if u]
+    if not items:
+        return None
+    langs, seen = [], set()
+    for l in lines:
+        if l.lower().startswith("join") or "@" in l or re.search(r"https?://", l):
+            continue
+        for w in LANG_WORDS:
+            if re.search(r"\b" + w + r"\b", l, re.I) and w not in seen:
+                seen.add(w)
+                langs.append(w)
+    return {"name": name, "season": season, "year": year, "language": " + ".join(langs), "files": items}
+
 def parse_pipe(text):
     p = [x.strip() for x in (text or "").split("|")]
     return {"title": p[0] or "Untitled",
@@ -388,6 +431,7 @@ def mb(n):
         return ""
     return f"{n / 1024**3:.1f} GB" if n >= 1024**3 else f"{n / 1024**2:.0f} MB"
 
+LAST = ()          # on_channel_post ka aakhri nateeja (forward se manual add par admin ko sahi jawab dene ke liye)
 MAIN_CHAT = None
 def remember_main(cid):
     global MAIN_CHAT
@@ -445,6 +489,7 @@ async def backup_edit(bot, msg):
                 break
 
 async def on_channel_post(update, context):
+    global LAST
     msg = update.channel_post or update.edited_channel_post
     if not msg.chat.username:
         print("Channel public hona chahiye (username set karo)")
@@ -477,6 +522,18 @@ async def on_channel_post(update, context):
                         g = g.replace(ms_.group(0), " ")
                 g = re.sub(r"\s+", " ", g).strip(" -~|*_")
                 d["name"] = g or d.get("name", "")
+        lfiles = []                      # quality ke saamne download link wale poster (files channel mein nahi)
+        if "name" not in d:
+            lp = parse_link_post(msg.caption, msg.caption_entities)
+            if lp:
+                d["name"] = lp["name"]
+                if lp["year"]:
+                    d["year"] = lp["year"]
+                d["season"] = str(lp["season"])
+                if lp["language"]:
+                    d["language"] = lp["language"]
+                d["quality"] = " | ".join(q for q, _, _ in lp["files"])
+                lfiles = lp["files"]
         ym = re.search(r"(?:19|20)\d{2}", d.get("year", "") or "")      # "2022-9-9" -> "2022"
         if ym:
             d["year"] = ym.group(0)
@@ -543,15 +600,26 @@ async def on_channel_post(update, context):
                         movies.child(str(tgt)).child("files").child(f"{msg.message_id}_{i}").set(
                             {"label": text, "season": 0, "link": url, "size": ""})
                         added += 1
+                if lfiles:      # card pehle se hai: jo download link nahi the wo jod do
+                    ex = db.reference(f"movies/{tgt}/files").get() or {}
+                    have_l = {f.get("link") for f in (ex.values() if isinstance(ex, dict) else ex) if f}
+                    for i, (q_, u_, sz_) in enumerate(lfiles):
+                        if u_ not in have_l:
+                            movies.child(str(tgt)).child("files").child(f"{msg.message_id}_L{i}").set(
+                                {"label": q_, "season": dseason, "link": u_, "size": sz_, "file": f"{d['name']} {q_}"})
+                            added += 1
                 if upgraded:
                     touch_meta()
                     print("Card upgrade hui:", title, "|", old_q, "->", d.get("quality", ""), "| purani files", "rakhi" if KEEP_OLD_FILES else "hata di")
+                    LAST = ("upgraded", title)
                 elif added:
                     touch_meta()
                     print("Card pehle se thi, ab buttons jod diye:", title, "| buttons:", added)
+                    LAST = ("buttons", added, title)
                 else:
                     print("Ye movie/season pehle se hai, dobara nahi jodi:", title, "(post", tgt, ")",
                           "| is post mein buttons:", len(btns))
+                    LAST = ("exists", tgt, db.reference(f"movies/{tgt}/title").get() or title)
                 return
             card = {
                 "title": title,
@@ -571,6 +639,9 @@ async def on_channel_post(update, context):
             for i, (text, url) in enumerate(btns):
                 movies.child(str(msg.message_id)).child("files").child(f"{msg.message_id}_{i}").set(
                     {"label": text, "season": 0, "link": url, "size": ""})
+            for i, (q_, u_, sz_) in enumerate(lfiles):
+                movies.child(str(msg.message_id)).child("files").child(f"{msg.message_id}_L{i}").set(
+                    {"label": q_, "season": dseason, "link": u_, "size": sz_, "file": f"{d['name']} {q_}"})
             if NAMES is None:
                 load_names()
             NAMES[msg.message_id] = (title_key(title), dseason)
@@ -578,6 +649,7 @@ async def on_channel_post(update, context):
             touch_meta()
             mg = merge_autos()           # pehle aayi bina-poster files ab is card mein aa jayein
             print("Saved:", title, "| buttons:", len(btns), "| merge:", mg if mg else "-")
+            LAST = ("created", title)
             return
 
     # Header post: sticker / animation / bina details wali photo (jaise "1080P", "SEASON 02")
@@ -592,6 +664,7 @@ async def on_channel_post(update, context):
                              + "\nFix: caption mein 'Movie Name: ...' ya 'Series Name: ...' likho, ya pehli line sirf naam rakho, phir caption edit karo.")
         db.reference("heads").child(str(msg.message_id)).set(True)
         print("Header post yaad rakhi:", msg.message_id)
+        LAST = ("header",)
         return
 
     # 2) File wali post
@@ -658,6 +731,7 @@ async def on_channel_post(update, context):
         dup = is_duplicate_file(target, msg.message_id, uid, name or first, mb(media.file_size))
         if dup:
             print("Pehle se judi hai, dobara nahi jodi:", label, "(post", dup, ")")
+            LAST = ("dup", dup, label)
             await tell_admin(context.bot, f"File add NAHI hui: wahi file (same file_unique_id) is card mein pehle se judi hai.\nNai post: {base}{msg.message_id}\nPehle wali post: {base}{dup}\nLabel: {label}")
             return
         heads, n = [], msg.message_id - 1
@@ -671,9 +745,11 @@ async def on_channel_post(update, context):
         movies.child(str(target)).child("files").child(str(msg.message_id)).set(entry)
         touch_meta()
         print("File jodi gayi:", label, "-> movie", target)
+        LAST = ("file", label, target)
         return
 
     print("Chhodi gayi: file ka naam ya caption nahi mila ->", name)
+    LAST = ("skipped",)
     await tell_admin(context.bot, f"File add NAHI hui: movie ka naam nahi mila aur koi card bhi nahi mila.\nFile: {name or first}\n{base}{msg.message_id}\nCaption mein 'Title: ...' ya 'File Name : ...' likho, ya poster ke baad bhejo.")
 
 
@@ -1031,26 +1107,35 @@ async def on_forwarded(update, context):
     if not (m.photo or m.document or m.video or m.audio):
         await m.reply_text("Poster (photo + caption) ya file wali post forward karo.")
         return
+    global LAST
     fwd = _Fwd(m, ch, int(mid))
+    LAST = ()
     try:
         await on_channel_post(SimpleNamespace(channel_post=None, edited_channel_post=fwd), context)
     except Exception as e:
         await m.reply_text("Add karte waqt error aaya: " + type(e).__name__ + " - " + str(e)[:150])
         return
     link = f"https://t.me/{ch.username}/{mid}"
-    if m.photo and m.caption:
-        t = db.reference(f"movies/{mid}/title").get()
-        await m.reply_text(f"Card ban gayi: {t}\n{link}\nApp mein 3 minute ke andar dikhegi." if t else
-                           f"Card nahi bani: caption ka format samajh nahi aaya.\n{link}\nCaption mein naam aur language/quality jaisi koi detail honi chahiye (ya `Movie Name: ...`).")
-        return
-    data = db.reference("movies").get() or {}
-    items = {str(k): v for k, v in (data.items() if isinstance(data, dict) else enumerate(data)) if v}
-    hit = next(((k, v) for k, v in items.items() if str(mid) in (v.get("files") or {})), None)
-    if hit:
-        f = hit[1]["files"][str(mid)] or {}
-        await m.reply_text(f"File judi: {hit[1].get('title', '')}\nLabel: {f.get('label', '')}\n{link}")
+    r = LAST or ("",)
+    if r[0] == "created":
+        await m.reply_text(f"Card ban gayi: {r[1]}\n{link}\nApp mein 3 minute ke andar dikhegi.")
+    elif r[0] == "upgraded":
+        await m.reply_text(f"Purani card behtar quality se upgrade ho gayi: {r[1]}")
+    elif r[0] == "buttons":
+        await m.reply_text(f"Card pehle se thi, {r[1]} naye button/file jod diye: {r[2]}")
+    elif r[0] == "exists":
+        await m.reply_text(f"Ye movie/series app mein PEHLE SE hai, isliye nayi card nahi bani.\nMojooda card: {r[2]}\nhttps://t.me/{ch.username}/{r[1]}\n"
+                           f"Isi poster ki alag card chahiye to pehle us card ko /remove https://t.me/{ch.username}/{r[1]} se hatao, phir ye post dobara forward karo.")
+    elif r[0] == "header":
+        await m.reply_text(f"Ye post card ke roop mein nahi padhi gayi (header ya bina-details wali photo maani gayi).\n{link}\nCaption mein naam aur language/quality jaisi koi detail honi chahiye (ya `Movie Name: ...`).")
+    elif r[0] == "file":
+        await m.reply_text(f"File judi: label {r[1]} -> card {r[2]}\n{link}")
+    elif r[0] == "dup":
+        await m.reply_text(f"File add nahi hui: wahi file pehle se judi hai (post {r[1]}).\n{link}")
+    elif r[0] == "skipped":
+        await m.reply_text(f"File nahi judi: naam ya card nahi mila.\n{link}\nCaption mein `File Name : ...` ya `Title: ...` likh kar dobara forward karo.")
     else:
-        await m.reply_text(f"File nahi judi.\n{link}\nWajah upar wale message mein hogi, ya caption mein `File Name : ...` ya `Title: ...` likh kar dobara forward karo.")
+        await m.reply_text("Bot ne is post par koi kaam nahi kiya. Poster (photo + caption) ya file wali post forward karo.")
 
 async def on_rebuildindex(update, context):
     # /rebuildindex -> purani saari movies ka halka index ek baar mein banao (naya app chalane se pehle ek baar)
