@@ -505,6 +505,15 @@ def mb(n):
     return f"{n / 1024**3:.1f} GB" if n >= 1024**3 else f"{n / 1024**2:.0f} MB"
 
 LAST = ()          # on_channel_post ka aakhri nateeja (forward se manual add par admin ko sahi jawab dene ke liye)
+# Sirf in channels ki posts app mein aayengi: ALLOWED_CHANNELS=rattansundri  (username ya -100... ID, comma se kai).
+# Khali ho to jis bhi channel mein bot admin ho, uski posts jud jati hain (purana tareeka).
+ALLOWED = [x.strip().lstrip("@").lower() for x in re.split(r"[,\s]+", os.environ.get("ALLOWED_CHANNELS", "")) if x.strip()]
+
+def channel_allowed(chat):
+    if not ALLOWED:
+        return True
+    return (getattr(chat, "username", None) or "").lower() in ALLOWED or str(getattr(chat, "id", "")) in ALLOWED
+
 MAIN_CHAT = None
 def remember_main(cid):
     global MAIN_CHAT
@@ -566,6 +575,9 @@ async def on_channel_post(update, context):
     msg = update.channel_post or update.edited_channel_post
     if not msg.chat.username:
         print("Channel public hona chahiye (username set karo)")
+        return
+    if not channel_allowed(msg.chat):
+        print("Ye channel ALLOWED_CHANNELS mein nahi hai, post chhodi:", msg.chat.username)
         return
     if update.channel_post and msg.chat.id not in BACKUP_IDS:
         remember_main(msg.chat.id)
@@ -831,14 +843,18 @@ async def on_channel_post(update, context):
 
 
 async def safe_copy(bot, chat_id, user, num, caption=None):
-    for attempt in range(4):
+    from_chat = "@" + user
+    for attempt in range(5):
         try:
             kw = {"caption": caption} if caption else {}
-            await bot.copy_message(chat_id=chat_id, from_chat_id="@" + user, message_id=int(num), **kw)
+            await bot.copy_message(chat_id=chat_id, from_chat_id=from_chat, message_id=int(num), **kw)
             return True
         except RetryAfter as e:      # Telegram ne kaha thoda ruko: ruk kar dobara koshish
             await asyncio.sleep(e.retry_after + 1)
         except Exception as e:
+            if "chat not found" in str(e).lower() and main_chat() and from_chat != main_chat():
+                from_chat = main_chat()          # channel ka username badal gaya ho to numeric ID se bhejo
+                continue
             print("Copy fail:", type(e).__name__, str(e)[:120])
             return False
     return False
@@ -1035,6 +1051,7 @@ async def on_help(update, context):
         "/pins - pin ki hui movies ki list\n"
         "Manual add: channel ki poster ya file wali post bot ki private chat mein FORWARD karo, bot use app mein jod dega\n"
         "/usage - Firebase mein kaunsi cheez kitni jagah gher rahi hai\n"
+        "/relink purana naya - channel ka username badla ho to app ke saare links naye username par karo\n"
         "/shrinkposters yes - purane posters chhote karo (pehle POSTER_W/H/QUALITY env chhote karo)\n"
         "/rebuildindex - app ke liye halka index banao (purani movies ke liye ek baar)\n"
         "/help - ye list\n\n"
@@ -1187,6 +1204,9 @@ async def on_forwarded(update, context):
         await m.reply_text("Poster (photo + caption) ya file wali post forward karo.")
         return
     global LAST
+    if not channel_allowed(ch):
+        await m.reply_text("Ye channel ALLOWED_CHANNELS mein nahi hai, isliye add nahi karunga.")
+        return
     fwd = _Fwd(m, ch, int(mid))
     LAST = ()
     try:
@@ -1294,6 +1314,41 @@ async def on_shrinkposters(update, context):
                                         + f".\nLagbhag {saved / 1024 / 1024:.1f} MB bacha.\nWebsite par purane poster 1 din tak cache mein dikh sakte hain.")
     finally:
         SHRINKING = False
+
+async def on_relink(update, context):
+    # Channel ka username badla ho to: /relink purana_username naya_username  -> app ke saare links naye username par
+    if not await admin_ok(update):
+        return
+    names = [re.sub(r"^(?:https?://)?(?:t\.me/|telegram\.me/)?@?", "", a.strip()).strip("/") for a in context.args]
+    if len(names) != 2 or not all(re.fullmatch(r"[A-Za-z0-9_]{4,32}", n) for n in names):
+        await update.message.reply_text("Aise likho:\n/relink purana_username naya_username\n(jaise /relink rattansundri rattan_movies)")
+        return
+    old, new = names
+    pat = re.compile(r"^https?://(?:t|telegram)\.me/" + re.escape(old) + r"/", re.I)
+    data = db.reference("movies").get() or {}
+    items = data.items() if isinstance(data, dict) else enumerate(data)
+    updates = {}
+    for k, v in items:
+        if not v:
+            continue
+        if pat.match(str(v.get("link", ""))):
+            updates[f"{k}/link"] = pat.sub(f"https://t.me/{new}/", v["link"])
+        fl = v.get("files") or {}
+        for fid, f in (fl.items() if isinstance(fl, dict) else enumerate(fl)):
+            if f and pat.match(str(f.get("link", ""))):
+                updates[f"{k}/files/{fid}/link"] = pat.sub(f"https://t.me/{new}/", f["link"])
+    if not updates:
+        await update.message.reply_text(f"'{old}' wale koi link nahi mile. Naam sahi likha hai?")
+        return
+    keys = list(updates)
+    for i in range(0, len(keys), 400):
+        db.reference("movies").update({k: updates[k] for k in keys[i:i + 400]})
+    global NAMES
+    NAMES = None
+    touch_meta()
+    await update.message.reply_text(f"{len(updates)} link badal diye: t.me/{old}/ se t.me/{new}/.\n"
+                                    f"Website ka Channel button bhi badlo: /setlink channel https://t.me/{new}\n"
+                                    "App mein 3 minute ke andar naye link dikhenge.")
 
 async def on_rebuildindex(update, context):
     # /rebuildindex -> purani saari movies ka halka index ek baar mein banao (naya app chalane se pehle ek baar)
@@ -1564,6 +1619,7 @@ async def post_init(application):
                 BotCommand("pins", "Pin ki hui movies ki list"),
                 BotCommand("rebuildindex", "App ka index dobara banao"),
                 BotCommand("usage", "Firebase mein kaun kitni jagah gher raha hai"),
+                BotCommand("relink", "Channel ka username badla: app ke links naye par karo"),
                 BotCommand("shrinkposters", "Purane posters chhote karo (storage kam)"),
                 BotCommand("start", "Bot shuru karo"),
             ], scope=BotCommandScopeChat(chat_id=ADMIN_ID))
@@ -1652,6 +1708,7 @@ app.add_handler(CommandHandler("delete", on_delete))
 app.add_handler(CommandHandler("merge", on_merge))
 app.add_handler(CommandHandler("rebuildindex", on_rebuildindex))
 app.add_handler(CommandHandler("usage", on_usage))
+app.add_handler(CommandHandler("relink", on_relink))
 app.add_handler(CommandHandler("shrinkposters", on_shrinkposters))
 app.add_handler(CommandHandler("pin", on_pin))
 app.add_handler(CommandHandler("unpin", on_unpin))
