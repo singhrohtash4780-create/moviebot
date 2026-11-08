@@ -443,7 +443,7 @@ def index_set(cid, card):
     db.reference(f"index/{cid}").set(d)
 
 # meta/updated badalte hi website ka poora cache naya ban jata hai (Firebase se phir download): isliye kai badlav ek saath ek hi baar mein likho
-META_MIN_GAP = int(os.environ.get("META_MIN_GAP", "60") or 60)       # seconds: itne mein ek hi baar badlo
+META_MIN_GAP = int(os.environ.get("META_MIN_GAP", "180") or 180)     # seconds: itne mein ek hi baar badlo (website 3 minute mein ek baar dekhti hai)
 _meta_last = 0.0
 _meta_timer = None
 _meta_lock = threading.Lock()
@@ -1035,6 +1035,7 @@ async def on_help(update, context):
         "/pins - pin ki hui movies ki list\n"
         "Manual add: channel ki poster ya file wali post bot ki private chat mein FORWARD karo, bot use app mein jod dega\n"
         "/usage - Firebase mein kaunsi cheez kitni jagah gher rahi hai\n"
+        "/shrinkposters yes - purane posters chhote karo (pehle POSTER_W/H/QUALITY env chhote karo)\n"
         "/rebuildindex - app ke liye halka index banao (purani movies ke liye ek baar)\n"
         "/help - ye list\n\n"
         "Auto tareeka: poster ke caption mein ek line likho  Also: Jannat 2, Jannat 3  to un naamo ki files apne aap us card mein aayengi.")
@@ -1233,6 +1234,66 @@ async def on_usage(update, context):
         avg = f", har ek ~{size / n / 1024:.1f} KB" if n else ""
         rows.append(f"{node}: {size / 1024 / 1024:.2f} MB ({n} cheez{avg})")
     await update.message.reply_text("Firebase ka hisaab:\n" + "\n".join(rows) + f"\nKul: {total / 1024 / 1024:.2f} MB")
+
+SHRINKING = False
+
+def _shrink_one(k):
+    """Ek purana poster chhota karo (agar naye POSTER_W/H se bada ho). ('done', bacha_hua_bytes) / ('skip', 0)"""
+    v = db.reference(f"posters/{k}").get()
+    if not isinstance(v, str) or not v.startswith("data:image") or "," not in v:
+        return "skip", 0
+    img = Image.open(io.BytesIO(base64.b64decode(v.split(",", 1)[1])))
+    if img.width <= POSTER_W and img.height <= POSTER_H:
+        return "skip", 0
+    img = img.convert("RGB")
+    img.thumbnail((POSTER_W, POSTER_H))
+    buf = io.BytesIO()
+    img.save(buf, "WEBP", quality=POSTER_QUALITY, method=6)
+    new = "data:image/webp;base64," + base64.b64encode(buf.getvalue()).decode()
+    if len(new) >= len(v) * 0.9:                  # khaas bachat nahi: waise hi rehne do
+        return "skip", 0
+    db.reference(f"posters/{k}").set(new)
+    return "done", len(v) - len(new)
+
+async def on_shrinkposters(update, context):
+    # /shrinkposters yes -> purane posters ko naye (chhote) POSTER_W / POSTER_H / POSTER_QUALITY par laao
+    global SHRINKING
+    if not await admin_ok(update):
+        return
+    if not context.args or context.args[0].lower() != "yes":
+        await update.message.reply_text(
+            f"Ye purane saare posters ko chhota karta hai (wapas nahi aayega).\nAbhi ka target: {POSTER_W}x{POSTER_H}, quality {POSTER_QUALITY}.\n"
+            "Pehle Render ke environment variables mein POSTER_W, POSTER_H, POSTER_QUALITY chhote karo (jaise 160, 240, 40) aur bot restart karo.\n"
+            "Phir chalao: /shrinkposters yes\nJo poster pehle se itne chhote hain unhe nahi chhedta.")
+        return
+    if SHRINKING:
+        await update.message.reply_text("Ye pehle se chal raha hai, thoda ruko.")
+        return
+    SHRINKING = True
+    try:
+        await update.message.reply_text("Shuru kar raha hu, kuch minute lagenge. Khatam hone par batata hu.")
+        try:
+            keys = list(((await asyncio.to_thread(lambda: db.reference("posters").get(shallow=True))) or {}).keys())
+        except TypeError:
+            keys = list(((await asyncio.to_thread(lambda: db.reference("posters").get())) or {}).keys())
+        done = skipped = bad = saved = 0
+        for k in keys:
+            try:
+                st, sv = await asyncio.to_thread(_shrink_one, k)
+            except Exception as e:
+                st, sv = "bad", 0
+                print("Poster shrink fail:", k, type(e).__name__, str(e)[:80])
+            if st == "done":
+                done += 1
+                saved += sv
+            elif st == "bad":
+                bad += 1
+            else:
+                skipped += 1
+        await update.message.reply_text(f"Ho gaya: {done} poster chhote kiye, {skipped} waise hi rakhe" + (f", {bad} nahi ho paye" if bad else "")
+                                        + f".\nLagbhag {saved / 1024 / 1024:.1f} MB bacha.\nWebsite par purane poster 1 din tak cache mein dikh sakte hain.")
+    finally:
+        SHRINKING = False
 
 async def on_rebuildindex(update, context):
     # /rebuildindex -> purani saari movies ka halka index ek baar mein banao (naya app chalane se pehle ek baar)
@@ -1503,6 +1564,7 @@ async def post_init(application):
                 BotCommand("pins", "Pin ki hui movies ki list"),
                 BotCommand("rebuildindex", "App ka index dobara banao"),
                 BotCommand("usage", "Firebase mein kaun kitni jagah gher raha hai"),
+                BotCommand("shrinkposters", "Purane posters chhote karo (storage kam)"),
                 BotCommand("start", "Bot shuru karo"),
             ], scope=BotCommandScopeChat(chat_id=ADMIN_ID))
     except Exception as e:
@@ -1590,6 +1652,7 @@ app.add_handler(CommandHandler("delete", on_delete))
 app.add_handler(CommandHandler("merge", on_merge))
 app.add_handler(CommandHandler("rebuildindex", on_rebuildindex))
 app.add_handler(CommandHandler("usage", on_usage))
+app.add_handler(CommandHandler("shrinkposters", on_shrinkposters))
 app.add_handler(CommandHandler("pin", on_pin))
 app.add_handler(CommandHandler("unpin", on_unpin))
 app.add_handler(CommandHandler("pins", on_pins))
