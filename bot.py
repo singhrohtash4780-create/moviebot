@@ -288,9 +288,13 @@ def same_name(a, b):
 def alias_hit(k, aliases):
     return any(k == a or k.startswith(a + " ") or same_name(k, a) for a in aliases)
 
-def merge_autos():
+def merge_autos(force=False):
     """Bina-poster wale card ki files, usi naam ke poster wale card mein daalo aur khali card hata do."""
-    load_names()
+    # Firebase se poori 'movies' list padhna bhaari hai (download badhta hai): jab koi bina-poster card hai hi nahi to dobara mat padho
+    if NAMES is None or force or AUTO:
+        load_names()
+    if not AUTO:
+        return 0
     merged = 0
     for i in sorted(AUTO):
         k, sn = NAMES.get(i, (None, 0))
@@ -373,7 +377,10 @@ def find_target(ident, label_text, mid):
     return target, NAMES[target][1]
 
 # ---- Poster: patti hatao, landscape ko blur canvas par rakho, chhota WebP banao ----
-POSTER_W, POSTER_H = 200, 300
+# Poster ka size/quality: chhota karne se Firebase ki storage aur download dono ghatte hain (naye posters par lagta hai)
+POSTER_W = int(os.environ.get("POSTER_W", "200") or 200)
+POSTER_H = int(os.environ.get("POSTER_H", "300") or 300)
+POSTER_QUALITY = int(os.environ.get("POSTER_QUALITY", "50") or 50)
 
 def strip_bottom_bar(img):
     """Neeche ki safed patti (jisme doosre channel ka naam hota hai) ho to hata do.
@@ -419,11 +426,11 @@ def make_poster(img):
         out.thumbnail((POSTER_W, POSTER_H))
     buf = io.BytesIO()
     try:
-        out.save(buf, "WEBP", quality=50, method=6)
+        out.save(buf, "WEBP", quality=POSTER_QUALITY, method=6)
         mime = "image/webp"
     except Exception:                      # WebP support na ho to JPEG
         buf = io.BytesIO()
-        out.save(buf, "JPEG", quality=50, optimize=True)
+        out.save(buf, "JPEG", quality=POSTER_QUALITY, optimize=True)
         mime = "image/jpeg"
     return f"data:{mime};base64," + base64.b64encode(buf.getvalue()).decode()
 
@@ -435,9 +442,31 @@ def index_set(cid, card):
         d["pin"] = pin                     # pin ki hui movie website par upar rehti hai
     db.reference(f"index/{cid}").set(d)
 
+# meta/updated badalte hi website ka poora cache naya ban jata hai (Firebase se phir download): isliye kai badlav ek saath ek hi baar mein likho
+META_MIN_GAP = int(os.environ.get("META_MIN_GAP", "60") or 60)       # seconds: itne mein ek hi baar badlo
+_meta_last = 0.0
+_meta_timer = None
+_meta_lock = threading.Lock()
+
+def _write_meta():
+    global _meta_last, _meta_timer
+    with _meta_lock:
+        _meta_timer = None
+        _meta_last = time.time()
+    db.reference("meta").update({"updated": int(time.time() * 1000)})
+
 def touch_meta():
     # App har kuch minute mein sirf yahi chhoti value padhta hai; badli ho tabhi poori list laata hai
-    db.reference("meta").update({"updated": int(time.time() * 1000)})
+    global _meta_timer
+    with _meta_lock:
+        wait = META_MIN_GAP - (time.time() - _meta_last)
+        now = wait <= 0
+        if not now and _meta_timer is None:
+            _meta_timer = threading.Timer(wait + 0.5, _write_meta)    # abhi nahi: thodi der baad ek baar
+            _meta_timer.daemon = True
+            _meta_timer.start()
+    if now:
+        _write_meta()
 
 # Quality ka darja (bada = behtar). Naya poster behtar quality ka aaye to purana card upgrade hota hai
 QUAL_RANK = {"cam": 1, "hdcam": 1, "hdts": 2, "hdtc": 2, "hdrip": 3, "dvdrip": 3, "webrip": 4, "webdl": 5, "bluray": 6}
@@ -981,7 +1010,7 @@ async def on_alias(update, context):
         if name not in al:
             al.append(name)
     ref.child("alias").set(al)
-    n = merge_autos()
+    n = merge_autos(force=True)
     await update.message.reply_text(f"Ab {', '.join(repr(x) for x in names)} ki files is card mein aayengi. {n} purana card mila diya.\nApp mein 3 minute ke andar badal jayega.")
 
 async def on_help(update, context):
@@ -1005,6 +1034,7 @@ async def on_help(update, context):
         "/unpin POST_LINK ya naam - pin hatao\n"
         "/pins - pin ki hui movies ki list\n"
         "Manual add: channel ki poster ya file wali post bot ki private chat mein FORWARD karo, bot use app mein jod dega\n"
+        "/usage - Firebase mein kaunsi cheez kitni jagah gher rahi hai\n"
         "/rebuildindex - app ke liye halka index banao (purani movies ke liye ek baar)\n"
         "/help - ye list\n\n"
         "Auto tareeka: poster ke caption mein ek line likho  Also: Jannat 2, Jannat 3  to un naamo ki files apne aap us card mein aayengi.")
@@ -1185,6 +1215,25 @@ async def on_forwarded(update, context):
     else:
         await m.reply_text("Bot ne is post par koi kaam nahi kiya. Poster (photo + caption) ya file wali post forward karo.")
 
+async def on_usage(update, context):
+    # /usage -> Firebase mein kaunsi cheez kitni jagah gher rahi hai (ek baar poora padhta hai, ~storage jitna download)
+    if not await admin_ok(update):
+        return
+    await update.message.reply_text("Naap raha hu (ek baar poora data padhna padega, thoda ruko)...")
+    rows, total = [], 0
+    for node in ("movies", "posters", "index", "heads", "backup", "meta", "config"):
+        try:
+            data = db.reference(node).get()
+        except Exception as e:
+            rows.append(f"{node}: padh nahi paya ({type(e).__name__})")
+            continue
+        size = len(json.dumps(data or {}, ensure_ascii=False).encode("utf-8"))
+        n = len(data) if isinstance(data, (dict, list)) else 0
+        total += size
+        avg = f", har ek ~{size / n / 1024:.1f} KB" if n else ""
+        rows.append(f"{node}: {size / 1024 / 1024:.2f} MB ({n} cheez{avg})")
+    await update.message.reply_text("Firebase ka hisaab:\n" + "\n".join(rows) + f"\nKul: {total / 1024 / 1024:.2f} MB")
+
 async def on_rebuildindex(update, context):
     # /rebuildindex -> purani saari movies ka halka index ek baar mein banao (naya app chalane se pehle ek baar)
     if not await admin_ok(update):
@@ -1286,7 +1335,7 @@ async def on_merge(update, context):
     # /merge -> bina-poster wale faltu cards ki files poster wale card mein jod do
     if not await admin_ok(update):
         return
-    n = merge_autos()
+    n = merge_autos(force=True)
     await update.message.reply_text(f"{n} faltu card poster wale card mein mila diye.\nApp mein 3 minute ke andar badal jayega." if n
                                     else "Koi faltu card nahi mila (ya uska poster wala card abhi nahi bana).")
 
@@ -1453,6 +1502,7 @@ async def post_init(application):
                 BotCommand("unpin", "Pin hatao"),
                 BotCommand("pins", "Pin ki hui movies ki list"),
                 BotCommand("rebuildindex", "App ka index dobara banao"),
+                BotCommand("usage", "Firebase mein kaun kitni jagah gher raha hai"),
                 BotCommand("start", "Bot shuru karo"),
             ], scope=BotCommandScopeChat(chat_id=ADMIN_ID))
     except Exception as e:
@@ -1539,6 +1589,7 @@ app.add_handler(CommandHandler("remove", on_remove))
 app.add_handler(CommandHandler("delete", on_delete))
 app.add_handler(CommandHandler("merge", on_merge))
 app.add_handler(CommandHandler("rebuildindex", on_rebuildindex))
+app.add_handler(CommandHandler("usage", on_usage))
 app.add_handler(CommandHandler("pin", on_pin))
 app.add_handler(CommandHandler("unpin", on_unpin))
 app.add_handler(CommandHandler("pins", on_pins))
@@ -1553,4 +1604,9 @@ app.add_handler(MessageHandler(filters.UpdateType.CHANNEL_POST | filters.UpdateT
 try:
     app.run_polling(allowed_updates=["channel_post", "edited_channel_post", "message"])
 finally:
+    try:
+        if _meta_timer is not None:
+            _write_meta()        # baaki bacha version badlav band hone se pehle likh do
+    except Exception:
+        pass
     release_lock()   # band hote hi lock chhod do, taaki doosra bot turant le le
