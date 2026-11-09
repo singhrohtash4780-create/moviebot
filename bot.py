@@ -117,7 +117,7 @@ def parse_link_post(text, entities=None):
 
     items, cur = [], None
     for l in lines:                                              # seedhe likhe links
-        q = re.search(r"(2160|1080|720|480|360)p", l, re.I)
+        q = re.search(r"(2160|1080|720|540|480|360)p", l, re.I)
         u = re.search(r"https?://[^\s\u3000]+", l)
         if q:
             cur = [q.group(1).lower() + "p", size_of(l), None]
@@ -142,7 +142,7 @@ def parse_link_post(text, entities=None):
             if li - back < 0:
                 break
             ln = clean_text(raw_lines[li - back])
-            qm = re.search(r"(2160|1080|720|480|360)p", ln, re.I)
+            qm = re.search(r"(2160|1080|720|540|480|360)p", ln, re.I)
             if qm:
                 q, sz = qm.group(1).lower() + "p", size_of(ln)
                 break
@@ -170,7 +170,7 @@ def parse_pipe(text):
 def make_label(text, default_season=0):
     # File ke naam/caption se label aur season nikalta hai
     t = text or ""
-    q = re.search(r"(2160p|1080p|720p|480p|360p)", t, re.I)
+    q = re.search(r"(2160p|1080p|720p|540p|480p|360p)", t, re.I)
     ep = re.search(r"(?<![A-Za-z])(?:S\d+)?E(\d{1,3})(?!\d)", t, re.I)
     se = (re.search(r"(?<![A-Za-z])S(\d{1,2})(?=E\d|[^A-Za-z0-9]|$)", t, re.I)
           or re.search(r"Season[ ._-]*(\d{1,2})", t, re.I))
@@ -181,7 +181,7 @@ def make_label(text, default_season=0):
     return (" ".join(x for x in parts if x) or "Watch"), season
 
 # ---- File ke naam se movie dhundhne ke helpers ----
-STOP = re.compile(r"[ ._-]*(?:S\d{1,2}E\d|S\d{1,2}(?![A-Za-z])|Season|(?<![A-Za-z])E\d{1,3}(?!\d)|(?:19|20)\d{2}|2160p|1080p|720p|480p|360p)", re.I)
+STOP = re.compile(r"[ ._-]*(?:S\d{1,2}E\d|S\d{1,2}(?![A-Za-z])|Season|(?<![A-Za-z])E\d{1,3}(?!\d)|(?:19|20)\d{2}|2160p|1080p|720p|540p|480p|360p)", re.I)
 
 # Naam ke shuru ka site ka tag: "(Movies4u.Bid).", "[1TamilMV] -", "www.site.com -" (movie ka naam nahi hota)
 LEAD_TAG = re.compile(r"^\s*(?:[\(\[\{][^\)\]\}]*[A-Za-z][^\)\]\}]*[\)\]\}]|www\.[A-Za-z0-9-]+\.[A-Za-z]{2,}|@[A-Za-z0-9_]{3,}"
@@ -775,7 +775,7 @@ async def on_channel_post(update, context):
         m_t = re.search(r"^\W*(?:title|movie\s*name|name)\s*['\u2019`]*\s*[:\-\u2013=]*\s*([^\n]+)", caption, re.I | re.M)
         t = m_t.group(1).strip(" \t-:'\u2019") if m_t else ""
         if t and not re.fullmatch(r"(?:movie|series|hindi|english)\b.*", t, re.I):
-            q = re.search(r"(2160|1080|720|480|360)p", caption, re.I)
+            q = re.search(r"(2160|1080|720|540|480|360)p", caption, re.I)
             name = t + (f" {q.group(1)}p" if q else "")
             has_name = True
     first = caption.strip().splitlines()[0] if caption.strip() else ""
@@ -842,13 +842,51 @@ async def on_channel_post(update, context):
     await tell_admin(context.bot, f"File add NAHI hui: movie ka naam nahi mila aur koi card bhi nahi mila.\nFile: {name or first}\n{base}{msg.message_id}\nCaption mein 'Title: ...' ya 'File Name : ...' likho, ya poster ke baad bhejo.")
 
 
+# Bot ne user ko jo files bheji unhe itne minute baad apne aap delete karo (0 = band). Render: AUTO_DELETE_MIN=10
+AUTO_DELETE_MIN = int(os.environ.get("AUTO_DELETE_MIN", "0") or 0)
+PENDING = []        # (kab_hatani_hai, chat_id, message_id)
+
+def schedule_delete(chat_id, msg_ids):
+    if AUTO_DELETE_MIN <= 0 or not msg_ids:
+        return
+    due = time.time() + AUTO_DELETE_MIN * 60
+    for mid in msg_ids:
+        PENDING.append((due, chat_id, mid))
+        try:      # restart ho jaye to bhi yaad rahe
+            db.reference(f"pending/{chat_id}_{mid}").set({"c": chat_id, "m": mid, "t": int(due)})
+        except Exception:
+            pass
+
+async def delete_sweeper(bot):
+    try:
+        for v in (db.reference("pending").get() or {}).values():
+            PENDING.append((v["t"], v["c"], v["m"]))
+    except Exception as e:
+        print("Pending delete list nahi padhi:", type(e).__name__)
+    while True:
+        await asyncio.sleep(20)
+        now = time.time()
+        due = [x for x in PENDING if x[0] <= now]
+        for x in due:
+            PENDING.remove(x)
+        for _, c, m in due:
+            try:
+                await bot.delete_message(chat_id=c, message_id=m)
+            except Exception:
+                pass                       # pehle hi hat chuka ho ya bahut purana
+            try:
+                db.reference(f"pending/{c}_{m}").delete()
+            except Exception:
+                pass
+            await asyncio.sleep(0.05)
+
 async def safe_copy(bot, chat_id, user, num, caption=None):
     from_chat = "@" + user
     for attempt in range(5):
         try:
             kw = {"caption": caption} if caption else {}
-            await bot.copy_message(chat_id=chat_id, from_chat_id=from_chat, message_id=int(num), **kw)
-            return True
+            res = await bot.copy_message(chat_id=chat_id, from_chat_id=from_chat, message_id=int(num), **kw)
+            return res.message_id
         except RetryAfter as e:      # Telegram ne kaha thoda ruko: ruk kar dobara koshish
             await asyncio.sleep(e.retry_after + 1)
         except Exception as e:
@@ -879,7 +917,9 @@ async def on_start(update, context):
         await update.message.reply_text("Is quality ki files nahi mili.")
         return
     files.sort(key=lambda f: [int(x) if x.isdigit() else x for x in re.split(r"(\d+)", str(f["label"]))])
-    await update.message.reply_text(f"{m.get('title', '')} - {q}: {len(files)} file bhej raha hu, thoda ruko...")
+    sent = []
+    st = await update.message.reply_text(f"{m.get('title', '')} - {q}: {len(files)} file bhej raha hu, thoda ruko...")
+    sent.append(st.message_id)
     for f in files:
         user, num = re.match(r"https://t\.me/([^/]+)/(\d+)", f["link"]).groups()
         # Pehle us file ke upar wale sticker/image (jaise 1080P, SEASON 02), phir file
@@ -887,13 +927,19 @@ async def on_start(update, context):
         if isinstance(heads, dict):
             heads = list(heads.values())
         for h in heads:
-            await safe_copy(context.bot, update.effective_chat.id, user, h)
+            r = await safe_copy(context.bot, update.effective_chat.id, user, h)
+            if r:
+                sent.append(r)
             await asyncio.sleep(1)
         # Caption mein file ka poora naam (Telegram upar naam kaat deta hai)
         cap = (f.get("file") or f"{m.get('title', '')} {f.get('label', '')}").strip()[:1000]
-        await safe_copy(context.bot, update.effective_chat.id, user, num, cap)
+        r = await safe_copy(context.bot, update.effective_chat.id, user, num, cap)
+        if r:
+            sent.append(r)
         await asyncio.sleep(1.5)
-    await update.message.reply_text("Ho gaya.")
+    done = await update.message.reply_text("Ho gaya." + (f"\nYe files {AUTO_DELETE_MIN} minute mein apne aap delete ho jayengi, abhi save ya forward kar lo." if AUTO_DELETE_MIN > 0 else ""))
+    sent.append(done.message_id)
+    schedule_delete(update.effective_chat.id, sent)
 
 # ---- Admin commands (sirf tum, Telegram se): app ka naam, logo aur links badlo, file edit kiye bina ----
 ADMIN_ID = int(os.environ.get("ADMIN_ID", "0") or 0)
@@ -1051,6 +1097,7 @@ async def on_help(update, context):
         "/pins - pin ki hui movies ki list\n"
         "Manual add: channel ki poster ya file wali post bot ki private chat mein FORWARD karo, bot use app mein jod dega\n"
         "/usage - Firebase mein kaunsi cheez kitni jagah gher rahi hai\n"
+        "/timer 10 - bot ki bheji hui files 10 minute baad apne aap delete (band: /timer off)\n"
         "/relink purana naya - channel ka username badla ho to app ke saare links naye username par karo\n"
         "/shrinkposters yes - purane posters chhote karo (pehle POSTER_W/H/QUALITY env chhote karo)\n"
         "/rebuildindex - app ke liye halka index banao (purani movies ke liye ek baar)\n"
@@ -1064,7 +1111,7 @@ async def on_setq(update, context):
     a = context.args
     pairs = []
     for i in range(0, len(a) - 1, 2):
-        qm = re.fullmatch(r"(2160|1080|720|480|360)p?", a[i + 1].strip(), re.I)
+        qm = re.fullmatch(r"(2160|1080|720|540|480|360)p?", a[i + 1].strip(), re.I)
         rg = re.search(r"(\d+)\s*[-\u2013]\s*(\d+)\s*$", a[i])         # range: LINK/2720-2735
         mid = re.search(r"(\d+)\s*$", a[i])
         if not qm:
@@ -1089,7 +1136,7 @@ async def on_setq(update, context):
             continue
         k, v = hit
         old = str((v["files"][pid] or {}).get("label", ""))
-        tag = re.sub(r"(2160|1080|720|480|360)p", "", old, flags=re.I).strip()
+        tag = re.sub(r"(2160|1080|720|540|480|360)p", "", old, flags=re.I).strip()
         tag = "" if tag.lower() == "watch" else tag
         label = (tag + " " + q).strip()
         db.reference(f"movies/{k}/files/{pid}/label").set(label)
@@ -1135,11 +1182,11 @@ async def on_setname(update, context):
         fentry = items[hit]["files"][pid] or {}
         old_label = str(fentry.get("label", ""))
         lab, sea = make_label(new, int(items[hit].get("season") or 0))        # naye naam se episode/season/quality dobara nikalo
-        oq = re.search(r"(2160|1080|720|480|360)p", old_label, re.I)
-        if oq and not re.search(r"(2160|1080|720|480|360)p", lab, re.I):          # naam mein quality nahi to purani quality rakho
+        oq = re.search(r"(2160|1080|720|540|480|360)p", old_label, re.I)
+        if oq and not re.search(r"(2160|1080|720|540|480|360)p", lab, re.I):          # naam mein quality nahi to purani quality rakho
             lab = ((lab if lab != "Watch" else "") + " " + oq.group(0).lower()).strip()
         db.reference(f"movies/{hit}/files/{pid}").update({"file": new, "label": lab, "season": sea})
-        extra = f"\nQuality: {oq.group(0).lower()}" if oq and not re.search(r"(2160|1080|720|480|360)p", new, re.I) else ""
+        extra = f"\nQuality: {oq.group(0).lower()}" if oq and not re.search(r"(2160|1080|720|540|480|360)p", new, re.I) else ""
         cap = ("File Name : " + new + extra)[:1024]     # isi format se bot is caption ko dobara padhe to wahi naam/label rahe
         # Main channel ki post ka caption bhi badlo (bot ko channel mein "Edit messages" ka haq chahiye)
         flink = str((items[hit]["files"][pid] or {}).get("link", ""))
@@ -1349,6 +1396,28 @@ async def on_relink(update, context):
     await update.message.reply_text(f"{len(updates)} link badal diye: t.me/{old}/ se t.me/{new}/.\n"
                                     f"Website ka Channel button bhi badlo: /setlink channel https://t.me/{new}\n"
                                     "App mein 3 minute ke andar naye link dikhenge.")
+
+async def on_timer(update, context):
+    # /timer 10 -> bot jo files user ko bheje wo 10 minute baad apne aap delete ho jayen.  /timer off  -> band
+    global AUTO_DELETE_MIN
+    if not await admin_ok(update):
+        return
+    arg = (context.args[0].lower() if context.args else "")
+    if not arg:
+        await update.message.reply_text(f"Abhi timer: {'band' if AUTO_DELETE_MIN <= 0 else str(AUTO_DELETE_MIN) + ' minute'}.\n"
+                                        "Badalne ke liye: /timer 10  (10 minute)  ya  /timer off")
+        return
+    if arg in ("off", "0", "band"):
+        mins = 0
+    elif arg.isdigit() and 1 <= int(arg) <= 1440:
+        mins = int(arg)
+    else:
+        await update.message.reply_text("Aise likho: /timer 10  (1 se 1440 minute)  ya  /timer off")
+        return
+    AUTO_DELETE_MIN = mins
+    db.reference("config").update({"timer": mins})
+    await update.message.reply_text("Timer band kar diya." if not mins else
+                                    f"Ab bot ki bheji hui files {mins} minute baad apne aap delete ho jayengi (nayi files par; jo pehle bheji gayi unka purana timer chalega).")
 
 async def on_rebuildindex(update, context):
     # /rebuildindex -> purani saari movies ka halka index ek baar mein banao (naya app chalane se pehle ek baar)
@@ -1598,6 +1667,14 @@ async def post_init(application):
     if db.reference("meta/updated").get() is None:
         touch_meta()                                       # app ko pehli value mil jaye
     print("Bot chalu:", me.username)
+    global AUTO_DELETE_MIN
+    try:
+        saved = db.reference("config/timer").get()
+        if isinstance(saved, (int, float)):
+            AUTO_DELETE_MIN = int(saved)         # /timer se jo set kiya wo env se upar
+    except Exception as e:
+        print("Timer padh nahi paya:", type(e).__name__)
+    asyncio.create_task(delete_sweeper(application.bot))      # AUTO_DELETE_MIN wali files ka timer
     # Telegram ke "/" menu mein commands dikhao: sab ko sirf /start, admin ko poori list
     try:
         await application.bot.set_my_commands([BotCommand("start", "Bot shuru karo")])
@@ -1620,6 +1697,7 @@ async def post_init(application):
                 BotCommand("rebuildindex", "App ka index dobara banao"),
                 BotCommand("usage", "Firebase mein kaun kitni jagah gher raha hai"),
                 BotCommand("relink", "Channel ka username badla: app ke links naye par karo"),
+                BotCommand("timer", "Bheji gayi files kitne minute baad delete hon"),
                 BotCommand("shrinkposters", "Purane posters chhote karo (storage kam)"),
                 BotCommand("start", "Bot shuru karo"),
             ], scope=BotCommandScopeChat(chat_id=ADMIN_ID))
@@ -1709,6 +1787,7 @@ app.add_handler(CommandHandler("merge", on_merge))
 app.add_handler(CommandHandler("rebuildindex", on_rebuildindex))
 app.add_handler(CommandHandler("usage", on_usage))
 app.add_handler(CommandHandler("relink", on_relink))
+app.add_handler(CommandHandler("timer", on_timer))
 app.add_handler(CommandHandler("shrinkposters", on_shrinkposters))
 app.add_handler(CommandHandler("pin", on_pin))
 app.add_handler(CommandHandler("unpin", on_unpin))
