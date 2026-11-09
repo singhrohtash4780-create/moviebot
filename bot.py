@@ -1099,6 +1099,7 @@ async def on_help(update, context):
         "/usage - Firebase mein kaunsi cheez kitni jagah gher rahi hai\n"
         "/timer 10 - bot ki bheji hui files 10 minute baad apne aap delete (band: /timer off)\n"
         "/relink purana naya - channel ka username badla ho to app ke saare links naye username par karo\n"
+        "/postertest - ek poster ko 4 size par dikhao (KB ke saath), phir sahi size chuno\n"
         "/shrinkposters yes - purane posters chhote karo (pehle POSTER_W/H/QUALITY env chhote karo)\n"
         "/rebuildindex - app ke liye halka index banao (purani movies ke liye ek baar)\n"
         "/help - ye list\n\n"
@@ -1303,6 +1304,41 @@ async def on_usage(update, context):
     await update.message.reply_text("Firebase ka hisaab:\n" + "\n".join(rows) + f"\nKul: {total / 1024 / 1024:.2f} MB")
 
 SHRINKING = False
+
+POSTER_PRESETS = [(200, 300, 50), (200, 300, 40), (180, 270, 45), (160, 240, 40)]
+
+async def on_postertest(update, context):
+    # /postertest [post_id] -> ek poster ko alag-alag size/quality par bana kar dikhao (KB ke saath), taaki dekh kar chuno
+    if not await admin_ok(update):
+        return
+    try:
+        keys = list(((await asyncio.to_thread(lambda: db.reference("posters").get(shallow=True))) or {}).keys())
+    except TypeError:
+        keys = list(((await asyncio.to_thread(lambda: db.reference("posters").get())) or {}).keys())
+    if not keys:
+        await update.message.reply_text("Koi poster nahi mila.")
+        return
+    key = context.args[0] if context.args and context.args[0] in keys else None
+    key = key or __import__("random").choice(keys)
+    v = await asyncio.to_thread(lambda: db.reference(f"posters/{key}").get())
+    if not isinstance(v, str) or "," not in v:
+        await update.message.reply_text("Ye poster padh nahi paya, dobara chalao.")
+        return
+    src = Image.open(io.BytesIO(base64.b64decode(v.split(",", 1)[1]))).convert("RGB")
+    lines = [f"Poster {key}: abhi {len(v) / 1024:.1f} KB, {src.width}x{src.height}"]
+    for w, h, q in POSTER_PRESETS:
+        im = src.copy()
+        im.thumbnail((w, h))
+        wb = io.BytesIO()
+        im.save(wb, "WEBP", quality=q, method=6)
+        kb = len(base64.b64encode(wb.getvalue())) / 1024
+        lines.append(f"{w}x{h} q{q}: {kb:.1f} KB  (~{kb * len(keys) / 1024:.1f} MB poore {len(keys)} ke)")
+        jb = io.BytesIO()
+        Image.open(io.BytesIO(wb.getvalue())).convert("RGB").save(jb, "JPEG", quality=92)   # sirf dikhane ke liye
+        jb.seek(0)
+        jb.name = "p.jpg"
+        await update.message.reply_photo(photo=jb, caption=f"{w}x{h} quality {q}: {kb:.1f} KB")
+    await update.message.reply_text("\n".join(lines) + "\n\nJo size saaf lage use Render mein POSTER_W / POSTER_H / POSTER_QUALITY mein daalo, restart karo, phir /shrinkposters yes.")
 
 def _shrink_one(k):
     """Ek purana poster chhota karo (agar naye POSTER_W/H se bada ho). ('done', bacha_hua_bytes) / ('skip', 0)"""
@@ -1699,6 +1735,7 @@ async def post_init(application):
                 BotCommand("relink", "Channel ka username badla: app ke links naye par karo"),
                 BotCommand("timer", "Bheji gayi files kitne minute baad delete hon"),
                 BotCommand("shrinkposters", "Purane posters chhote karo (storage kam)"),
+                BotCommand("postertest", "Poster ke alag size dekh kar chuno"),
                 BotCommand("start", "Bot shuru karo"),
             ], scope=BotCommandScopeChat(chat_id=ADMIN_ID))
     except Exception as e:
@@ -1789,6 +1826,7 @@ app.add_handler(CommandHandler("usage", on_usage))
 app.add_handler(CommandHandler("relink", on_relink))
 app.add_handler(CommandHandler("timer", on_timer))
 app.add_handler(CommandHandler("shrinkposters", on_shrinkposters))
+app.add_handler(CommandHandler("postertest", on_postertest))
 app.add_handler(CommandHandler("pin", on_pin))
 app.add_handler(CommandHandler("unpin", on_unpin))
 app.add_handler(CommandHandler("pins", on_pins))
