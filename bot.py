@@ -443,7 +443,7 @@ def index_set(cid, card):
     db.reference(f"index/{cid}").set(d)
 
 # meta/updated badalte hi website ka poora cache naya ban jata hai (Firebase se phir download): isliye kai badlav ek saath ek hi baar mein likho
-META_MIN_GAP = int(os.environ.get("META_MIN_GAP", "180") or 180)     # seconds: itne mein ek hi baar badlo (website 3 minute mein ek baar dekhti hai)
+META_MIN_GAP = int(os.environ.get("META_MIN_GAP", "45") or 45)       # seconds: itne mein ek hi baar badlo (kam = jaldi dikhe, zyada = Firebase download kam)
 _meta_last = 0.0
 _meta_timer = None
 _meta_lock = threading.Lock()
