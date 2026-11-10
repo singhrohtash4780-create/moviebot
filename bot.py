@@ -4,10 +4,10 @@ import os, io, re, json, unicodedata, uuid, socket, base64, asyncio, time, threa
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import firebase_admin
 from firebase_admin import credentials, db
-from telegram import BotCommand, BotCommandScopeChat
+from telegram import BotCommand, BotCommandScopeChat, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, MessageHandler, CommandHandler, filters
 from PIL import Image, ImageFilter, ImageOps
-from telegram.error import RetryAfter
+from telegram.error import RetryAfter, Forbidden
 from types import SimpleNamespace
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
@@ -434,13 +434,36 @@ def make_poster(img):
         mime = "image/jpeg"
     return f"data:{mime};base64," + base64.b64encode(buf.getvalue()).decode()
 
-def index_set(cid, card):
-    """Halka index (sirf naam, quality, date): app list isse banati hai, poora movie data nahi mangti."""
+def lang_short(language):
+    """Lambi language line se sirf bhasha ke naam: 'Multi Audio [Hindi ORG. + English]' -> 'Hindi, English' (website ke filter ke liye)."""
+    found = []
+    for w in LANG_WORDS:
+        if re.search(r"\b" + w + r"\b", language or "", re.I) and w not in found:
+            found.append(w)
+    return ", ".join(found)[:40]
+
+def index_entry(cid, card, lookup=True):
+    """Halka index: naam, quality, date (+ pin, bhasha, season). lookup=False ho to Firebase se kuch aur nahi padhta."""
     d = {"title": card.get("title", ""), "quality": card.get("quality", ""), "date": card.get("date", "")}
-    pin = card.get("pin") or db.reference(f"movies/{cid}/pin").get()
+    pin = card.get("pin") or (db.reference(f"movies/{cid}/pin").get() if lookup else None)
     if pin:
         d["pin"] = pin                     # pin ki hui movie website par upar rehti hai
-    db.reference(f"index/{cid}").set(d)
+    lang = card.get("language")
+    if lang is None and lookup:
+        lang = db.reference(f"movies/{cid}/language").get()
+    ls = lang_short(lang or "")
+    if ls:
+        d["lang"] = ls
+    sn = card.get("season")
+    if sn is None and lookup:
+        sn = db.reference(f"movies/{cid}/season").get()
+    if sn:
+        d["sn"] = int(sn)
+    return d
+
+def index_set(cid, card):
+    """Halka index (naam, quality, date, ...): app list isse banati hai, poora movie data nahi mangti."""
+    db.reference(f"index/{cid}").set(index_entry(cid, card))
 
 # meta/updated badalte hi website ka poora cache naya ban jata hai (Firebase se phir download): isliye kai badlav ek saath ek hi baar mein likho
 META_MIN_GAP = int(os.environ.get("META_MIN_GAP", "45") or 45)       # seconds: itne mein ek hi baar badlo (kam = jaldi dikhe, zyada = Firebase download kam)
@@ -698,10 +721,12 @@ async def on_channel_post(update, context):
                     touch_meta()
                     print("Card upgrade hui:", title, "|", old_q, "->", d.get("quality", ""), "| purani files", "rakhi" if KEEP_OLD_FILES else "hata di")
                     LAST = ("upgraded", title)
+                    bump("upgraded")
                 elif added:
                     touch_meta()
                     print("Card pehle se thi, ab buttons jod diye:", title, "| buttons:", added)
                     LAST = ("buttons", added, title)
+                    note_new_file(tgt, f"{added} naye link")
                 else:
                     print("Ye movie/season pehle se hai, dobara nahi jodi:", title, "(post", tgt, ")",
                           "| is post mein buttons:", len(btns))
@@ -736,6 +761,7 @@ async def on_channel_post(update, context):
             mg = merge_autos()           # pehle aayi bina-poster files ab is card mein aa jayein
             print("Saved:", title, "| buttons:", len(btns), "| merge:", mg if mg else "-")
             LAST = ("created", title)
+            bump("cards")
             return
 
     # Header post: sticker / animation / bina details wali photo (jaise "1080P", "SEASON 02")
@@ -821,6 +847,7 @@ async def on_channel_post(update, context):
         if dup:
             print("Pehle se judi hai, dobara nahi jodi:", label, "(post", dup, ")")
             LAST = ("dup", dup, label)
+            bump("skipped")
             await tell_admin(context.bot, f"File add NAHI hui: wahi file (same file_unique_id) is card mein pehle se judi hai.\nNai post: {base}{msg.message_id}\nPehle wali post: {base}{dup}\nLabel: {label}")
             return
         heads, n = [], msg.message_id - 1
@@ -835,10 +862,13 @@ async def on_channel_post(update, context):
         touch_meta()
         print("File jodi gayi:", label, "-> movie", target)
         LAST = ("file", label, target)
+        bump("files")
+        note_new_file(target, label)
         return
 
     print("Chhodi gayi: file ka naam ya caption nahi mila ->", name)
     LAST = ("skipped",)
+    bump("skipped")
     await tell_admin(context.bot, f"File add NAHI hui: movie ka naam nahi mila aur koi card bhi nahi mila.\nFile: {name or first}\n{base}{msg.message_id}\nCaption mein 'Title: ...' ya 'File Name : ...' likho, ya poster ke baad bhejo.")
 
 
@@ -880,6 +910,182 @@ async def delete_sweeper(bot):
                 pass
             await asyncio.sleep(0.05)
 
+# ---------- Roz ki report ke aankde (aaj ka din, India time) ----------
+STATS = {}
+STATS_DATE = ""
+_stats_dirty = False
+_rh = (os.environ.get("REPORT_HOUR", "22") or "22").strip()
+REPORT_HOUR = int(_rh) if re.fullmatch(r"-?\d+", _rh) else -1       # raat 10 baje; "off" likho to band
+
+def ist_date():
+    return time.strftime("%Y%m%d", time.gmtime(time.time() + 19800))
+
+def bump(key, n=1):
+    global _stats_dirty
+    STATS[key] = STATS.get(key, 0) + n
+    _stats_dirty = True
+
+def build_report():
+    s_ = STATS
+    try:
+        total = len(_keys("index"))
+    except Exception:
+        total = "?"
+    d = STATS_DATE or ist_date()
+    return (f"Aaj ki report ({d[6:8]}-{d[4:6]}-{d[:4]}):\n"
+            f"Nayi cards: {s_.get('cards', 0)} (upgrade: {s_.get('upgraded', 0)})\n"
+            f"Files judi: {s_.get('files', 0)}\n"
+            f"Files jo judi nahi: {s_.get('skipped', 0)}\n"
+            f"Users ko files bheji gayi (baar): {s_.get('served', 0)}\n"
+            f"File reports: {s_.get('reports', 0)}\n"
+            f"Naye subscribers: {s_.get('subs', 0)} | Notify bheje: {s_.get('notified', 0)}\n"
+            f"Kul cards app mein: {total}\n"
+            "Firebase ka poora hisaab: /usage")
+
+async def stats_loop(bot):
+    global STATS, STATS_DATE, _stats_dirty
+    STATS_DATE = ist_date()
+    try:
+        STATS = dict(db.reference(f"stats/{STATS_DATE}").get() or {})
+    except Exception:
+        STATS = {}
+    last_report = ""
+    try:
+        last_report = db.reference("stats/last_report").get() or ""
+    except Exception:
+        pass
+    ticks = 0
+    while True:
+        await asyncio.sleep(60)
+        ticks += 1
+        try:
+            today = ist_date()
+            if today != STATS_DATE:                       # din badla: pichle din ke aankde save karo
+                if _stats_dirty:
+                    db.reference(f"stats/{STATS_DATE}").set(STATS)
+                STATS, STATS_DATE, _stats_dirty = {}, today, False
+            elif _stats_dirty and ticks % 5 == 0:
+                db.reference(f"stats/{STATS_DATE}").set(STATS)
+                _stats_dirty = False
+            hour = int(time.strftime("%H", time.gmtime(time.time() + 19800)))
+            if REPORT_HOUR >= 0 and hour == REPORT_HOUR and last_report != today and ADMIN_ID:
+                last_report = today
+                db.reference("stats/last_report").set(today)
+                if _stats_dirty:
+                    db.reference(f"stats/{STATS_DATE}").set(STATS)
+                    _stats_dirty = False
+                await tell_admin(bot, build_report())
+        except Exception as e:
+            print("Stats loop error:", type(e).__name__, str(e)[:100])
+
+# ---------- Nayi file judte hi subscribers ko batao ----------
+NOTIFY = {}
+SITE_URL = os.environ.get("SITE_URL", "").strip().rstrip("/")     # jaise https://tumhari-site.workers.dev  (khali ho to link nahi jata)
+
+def note_new_file(cid, label):
+    d = NOTIFY.setdefault(str(cid), {"labels": [], "last": 0})
+    d["labels"].append(label)
+    d["last"] = time.time()
+
+async def notify_sweeper(bot):
+    while True:
+        await asyncio.sleep(30)
+        now = time.time()
+        for cid, d in list(NOTIFY.items()):
+            if now - d["last"] < 90:                     # kuch der shaant ho to ek hi message bhejo (12 episode = 12 message nahi)
+                continue
+            NOTIFY.pop(cid, None)
+            try:
+                subs = db.reference(f"subs/{cid}").get() or {}
+                if not subs:
+                    continue
+                title = db.reference(f"movies/{cid}/title").get() or ""
+                labs = list(dict.fromkeys(d["labels"]))
+                shown = ", ".join(labs[:6]) + (f" ... aur {len(labs) - 6}" if len(labs) > 6 else "")
+                text = f"Nayi file judi: {title}\n{shown}" + (f"\n{SITE_URL}/#m{cid}" if SITE_URL else "")
+                for uid in list(subs.keys()):
+                    try:
+                        await bot.send_message(chat_id=int(uid), text=text, disable_web_page_preview=True)
+                        bump("notified")
+                    except Forbidden:
+                        db.reference(f"subs/{cid}/{uid}").delete()        # user ne bot band kar diya
+                    except RetryAfter as e:
+                        await asyncio.sleep(e.retry_after + 1)
+                    except Exception:
+                        pass
+                    await asyncio.sleep(0.06)
+            except Exception as e:
+                print("Notify error:", type(e).__name__, str(e)[:100])
+
+# ---------- Pehle channel join karo (FORCE_SUB=rattansundri, comma se kai) ----------
+FORCE_SUB = [x.strip() for x in re.split(r"[,\s]+", os.environ.get("FORCE_SUB", "")) if x.strip()]
+_MEMBER_OK = {}
+_force_warned = False
+
+async def sub_gate(update, context, arg):
+    """True = files de sakte ho. False = user ko channel join karne ka message de diya."""
+    global _force_warned
+    if not FORCE_SUB:
+        return True
+    uid = update.effective_user.id
+    if uid == ADMIN_ID or time.time() - _MEMBER_OK.get(uid, 0) < 300:
+        return True
+    missing = []
+    for ch in FORCE_SUB:
+        chat = int(ch) if re.fullmatch(r"-?\d+", ch) else ("@" + ch.lstrip("@"))
+        try:
+            m = await context.bot.get_chat_member(chat, uid)
+            ok = m.status in ("creator", "administrator", "member") or (m.status == "restricted" and getattr(m, "is_member", False))
+        except Exception as e:
+            ok = True                                    # jaanch na ho paye to user ko roko mat
+            print("Force-sub jaanch fail:", ch, type(e).__name__, str(e)[:80])
+            if not _force_warned:
+                _force_warned = True
+                await tell_admin(context.bot, f"FORCE_SUB: {ch} mein membership jaanch nahi ho pa rahi ({type(e).__name__}). Bot ko us channel mein Admin banao. Tab tak sab ko files mil rahi hain.")
+        if not ok:
+            missing.append(ch)
+    if not missing:
+        _MEMBER_OK[uid] = time.time()
+        return True
+    rows = [[InlineKeyboardButton("Channel join karo", url="https://t.me/" + ch.lstrip("@"))] for ch in missing if not re.fullmatch(r"-?\d+", ch)]
+    rows.append([InlineKeyboardButton("Join kar liya, files do", url=f"https://t.me/{context.bot.username}?start={arg}")])
+    await update.message.reply_text("Files lene ke liye pehle hamara channel join karo, phir neeche wala button dabao.", reply_markup=InlineKeyboardMarkup(rows))
+    return False
+
+# ---------- Website ke Notify / Report buttons: https://t.me/<bot>?start=n-ID, u-ID, r-ID ----------
+_REPORT_SEEN = {}
+
+async def start_action(update, context, act, cid):
+    title = db.reference(f"movies/{cid}/title").get()
+    if not title:
+        await update.message.reply_text("Ye movie ab app mein nahi hai.")
+        return
+    u = update.effective_user
+    bu = context.bot.username
+    if act == "n":
+        db.reference(f"subs/{cid}/{u.id}").set(int(time.time()))
+        bump("subs")
+        await update.message.reply_text(f"Theek hai! {title} mein nayi file ya episode judte hi yahin bata dunga.\nBand karne ke liye: https://t.me/{bu}?start=u-{cid}")
+    elif act == "u":
+        db.reference(f"subs/{cid}/{u.id}").delete()
+        await update.message.reply_text(f"{title} ki soochna band kar di.")
+    else:
+        now = time.time()
+        recent = [t for t in _REPORT_SEEN.get(u.id, []) if now - t < 3600]
+        if len(recent) >= 3:
+            await update.message.reply_text("Aap ek ghante mein 3 report bhej chuke ho, thodi der baad dobara bhejna.")
+            return
+        _REPORT_SEEN[u.id] = recent + [now]
+        prev = db.reference(f"reports/{cid}/{u.id}").get()
+        if prev and now - prev < 6 * 3600:
+            await update.message.reply_text("Aapki report pehle hi mil chuki hai, hum dekh rahe hain. Shukriya!")
+            return
+        db.reference(f"reports/{cid}/{u.id}").set(int(now))
+        n = len(_keys(f"reports/{cid}"))
+        bump("reports")
+        await tell_admin(context.bot, f"File report: {title}\nCard ID: {cid} | Kul reporters: {n}\nUser: {u.first_name or ''} @{u.username or '-'} ({u.id})\nDekho: /find {cid}")
+        await update.message.reply_text("Shukriya! Report mil gayi, hum jaldi theek karenge.")
+
 async def safe_copy(bot, chat_id, user, num, caption=None):
     from_chat = "@" + user
     for attempt in range(5):
@@ -901,6 +1107,12 @@ async def on_start(update, context):
     # App ka quality button: https://t.me/<bot>?start=<movie_id>-<season>-<quality>
     if not context.args:
         await update.message.reply_text("Namaste! Movie app mein quality button dabaoge to files yahin aa jayengi.")
+        return
+    mm = re.fullmatch(r"([nur])-(\d+)", context.args[0])
+    if mm:                                              # Notify / band / report
+        await start_action(update, context, mm.group(1), mm.group(2))
+        return
+    if not await sub_gate(update, context, context.args[0]):
         return
     try:
         mid, season, q = context.args[0].split("-", 2)
@@ -937,6 +1149,7 @@ async def on_start(update, context):
         if r:
             sent.append(r)
         await asyncio.sleep(1.5)
+    bump("served")
     done = await update.message.reply_text("Ho gaya." + (f"\nYe files {AUTO_DELETE_MIN} minute mein apne aap delete ho jayengi, abhi save ya forward kar lo." if AUTO_DELETE_MIN > 0 else ""))
     sent.append(done.message_id)
     schedule_delete(update.effective_chat.id, sent)
@@ -1101,6 +1314,11 @@ async def on_help(update, context):
         "/relink purana naya - channel ka username badla ho to app ke saare links naye username par karo\n"
         "/postertest - ek poster ko 4 size par dikhao (KB ke saath), phir sahi size chuno\n"
         "/shrinkposters yes - purane posters chhote karo (pehle POSTER_W/H/QUALITY env chhote karo)\n"
+        "/stats - aaj ki report (nayi cards, files, user reports); roz raat ko apne aap bhi aati hai\n"
+        "/find Naam ya ID - movie dhundo: ID, link, kitni files\n"
+        "/title POST_LINK Naya Naam - card ka naam badlo\n"
+        "/backup - data ki backup zip file chat mein (/backup posters = posters ke saath)\n"
+        "/check - cards ki jaanch (khali, dohre, poster nahi); /check fix = bina-card wali cheezein hatao\n"
         "/rebuildindex - app ke liye halka index banao (purani movies ke liye ek baar)\n"
         "/help - ye list\n\n"
         "Auto tareeka: poster ke caption mein ek line likho  Also: Jannat 2, Jannat 3  to un naamo ki files apne aap us card mein aayengi.")
@@ -1305,7 +1523,7 @@ async def on_usage(update, context):
 
 SHRINKING = False
 
-POSTER_PRESETS = [(200, 300, 50), (200, 300, 40), (180, 270, 45), (160, 240, 40)]
+POSTER_PRESETS = [(165, 248, 50), (165, 248, 45), (165, 248, 40), (150, 225, 40)]
 
 async def on_postertest(update, context):
     # /postertest [post_id] -> ek poster ko alag-alag size/quality par bana kar dikhao (KB ke saath), taaki dekh kar chuno
@@ -1332,7 +1550,8 @@ async def on_postertest(update, context):
         wb = io.BytesIO()
         im.save(wb, "WEBP", quality=q, method=6)
         kb = len(base64.b64encode(wb.getvalue())) / 1024
-        lines.append(f"{w}x{h} q{q}: {kb:.1f} KB  (~{kb * len(keys) / 1024:.1f} MB poore {len(keys)} ke)")
+        same = " (poster pehle se itna ya isse chhota hai: size nahi badla, sirf quality)" if im.width >= src.width and im.height >= src.height else ""
+        lines.append(f"{w}x{h} q{q}: {kb:.1f} KB  (~{kb * len(keys) / 1024:.1f} MB poore {len(keys)} ke){same}")
         jb = io.BytesIO()
         Image.open(io.BytesIO(wb.getvalue())).convert("RGB").save(jb, "JPEG", quality=92)   # sirf dikhane ke liye
         jb.seek(0)
@@ -1346,14 +1565,12 @@ def _shrink_one(k):
     if not isinstance(v, str) or not v.startswith("data:image") or "," not in v:
         return "skip", 0
     img = Image.open(io.BytesIO(base64.b64decode(v.split(",", 1)[1])))
-    if img.width <= POSTER_W and img.height <= POSTER_H:
-        return "skip", 0
     img = img.convert("RGB")
-    img.thumbnail((POSTER_W, POSTER_H))
+    img.thumbnail((POSTER_W, POSTER_H))        # sirf chhota hota hai, bada nahi; quality bhi naye POSTER_QUALITY par
     buf = io.BytesIO()
     img.save(buf, "WEBP", quality=POSTER_QUALITY, method=6)
     new = "data:image/webp;base64," + base64.b64encode(buf.getvalue()).decode()
-    if len(new) >= len(v) * 0.9:                  # khaas bachat nahi: waise hi rehne do
+    if len(new) >= len(v) * 0.9:                  # 10% se kam bachat: waise hi rehne do (isse dobara chalane par bigadta nahi)
         return "skip", 0
     db.reference(f"posters/{k}").set(new)
     return "done", len(v) - len(new)
@@ -1455,6 +1672,170 @@ async def on_timer(update, context):
     await update.message.reply_text("Timer band kar diya." if not mins else
                                     f"Ab bot ki bheji hui files {mins} minute baad apne aap delete ho jayengi (nayi files par; jo pehle bheji gayi unka purana timer chalega).")
 
+def _keys(path):
+    """Ek node ki sirf keys (poora data nahi): shallow chale to wahi, warna poora padho."""
+    ref = db.reference(path)
+    try:
+        d = ref.get(shallow=True)
+    except TypeError:
+        d = ref.get()
+    return list(d.keys()) if isinstance(d, dict) else []
+
+def _items_of(data):
+    return {str(k): v for k, v in (data.items() if isinstance(data, dict) else enumerate(data or [])) if v}
+
+def _short(items, ids, n=8):
+    rows = [f"{k} - {(items.get(k) or {}).get('title', '?')[:45]}" for k in ids[:n]]
+    return "\n".join(rows) + (f"\n... aur {len(ids) - n}" if len(ids) > n else "")
+
+async def on_find(update, context):
+    # /find Naam  ya  /find POST_ID  -> card ki ID, link, files ginti
+    if not await admin_ok(update):
+        return
+    arg = " ".join(context.args).strip()
+    if not arg:
+        await update.message.reply_text("Aise likho:\n/find Gangs of Wasseypur\n/find 468  (card ki ID ya link ke saath poori jaankari)")
+        return
+    mt = re.search(r"(?:/|^)(\d+)\s*$", arg)
+    if mt:
+        cid = mt.group(1)
+        card = db.reference(f"movies/{cid}").get()
+        if not card:
+            await update.message.reply_text("Is ID ka card nahi mila.")
+            return
+        files = card.get("files") or {}
+        n = len(files)
+        has_poster = cid in set(_keys("posters"))
+        labels = sorted({str(f.get("label", "")) for f in (files.values() if isinstance(files, dict) else files) if f})[:12]
+        await update.message.reply_text(
+            f"{cid} - {card.get('title', '')}\nLanguage: {card.get('language', '') or '-'} | Quality: {card.get('quality', '') or '-'} | Season: {card.get('season', 0)}\n"
+            f"Files: {n}" + (f" ({', '.join(labels)})" if labels else "") + f"\nPoster: {'haan' if has_poster else 'NAHI'} | Pin: {'haan' if card.get('pin') else 'nahi'}\n"
+            f"Link: {card.get('link', '')}")
+        return
+    qk = title_key(arg)
+    if not qk:
+        await update.message.reply_text("Naam samajh nahi aaya.")
+        return
+    idx = db.reference("index").get() or {}
+    hits = [(k, v.get("title", "")) for k, v in idx.items() if v and qk in title_key(v.get("title", ""))]
+    if not hits:
+        await update.message.reply_text("Is naam ki koi movie nahi mili.")
+        return
+    lines = []
+    for k, t in hits[:8]:
+        n = len(_keys(f"movies/{k}/files"))
+        lines.append(f"{k} - {t[:50]} | files: {n}")
+    await update.message.reply_text(f"{len(hits)} mili:\n" + "\n".join(lines) + (f"\n... aur {len(hits) - 8}, naam thoda aur likho" if len(hits) > 8 else "")
+                                    + "\n\nPoori jaankari ke liye: /find ID")
+
+async def on_title(update, context):
+    # /title POST_LINK Naya Naam -> card ka naam badlo (saal/season chahiye to naam mein khud likho)
+    if not await admin_ok(update):
+        return
+    mt = re.search(r"(?:/|^)(\d+)\s*$", context.args[0]) if context.args else None
+    new = " ".join(context.args[1:]).strip()
+    if not mt or not new or len(new) > 120:
+        await update.message.reply_text("Aise likho:\n/title https://t.me/tumhara_channel/468 Gangs of Wasseypur (2012)\n(card ka link ya ID, phir poora naya naam; saal/season chahiye to wo bhi likho)")
+        return
+    cid = mt.group(1)
+    card = db.reference(f"movies/{cid}").get()
+    if not card:
+        await update.message.reply_text("Is ID ka card nahi mila. Card ki ID /find se dekho.")
+        return
+    old = card.get("title", "")
+    db.reference(f"movies/{cid}/title").set(new)
+    index_set(cid, {**card, "title": new})
+    global NAMES
+    NAMES = None
+    touch_meta()
+    await update.message.reply_text(f"Naam badal diya:\nPehle: {old}\nAb: {new}\nApp mein 1-2 minute ke andar badlega.")
+
+async def on_backup(update, context):
+    # /backup  -> movies, index, config ki zip file chat mein.   /backup posters -> posters bhi (bhaari, ~20 MB)
+    import zipfile
+    if not await admin_ok(update):
+        return
+    with_posters = bool(context.args and context.args[0].lower() == "posters")
+    await update.message.reply_text("Backup bana raha hu" + (" (posters ke saath, thoda zyada waqt lagega)" if with_posters else "") + "...")
+
+    def build():
+        nodes = ["movies", "index", "config", "meta", "heads", "backup"] + (["posters"] if with_posters else [])
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+            for n in nodes:
+                z.writestr(n + ".json", json.dumps(db.reference(n).get(), ensure_ascii=False))
+        return buf.getvalue()
+
+    data = await asyncio.to_thread(build)
+    mb_ = len(data) / 1024 / 1024
+    if mb_ > 49:
+        await update.message.reply_text(f"Backup {mb_:.0f} MB ka ban gaya, Telegram ki 50 MB hadd se bada hai. Bina posters ke chalao: /backup")
+        return
+    bio = io.BytesIO(data)
+    bio.name = "rattan-backup-" + time.strftime("%Y%m%d-%H%M") + (".zip")
+    await update.message.reply_document(document=bio, caption=f"Backup ({mb_:.1f} MB). Wapas laane ke liye Firebase console mein us node ke teen dot menu se Import JSON.")
+
+def _check_data(items, idx_keys, poster_keys):
+    """Cards ki jaanch (sirf padhta hai). Har cheez ID ki list hai."""
+    groups = {}
+    for k, v in items.items():
+        groups.setdefault((title_key(v.get("title", "")), v.get("season", 0) or 0, card_year(v.get("title", ""))), []).append(k)
+    def labels(v):
+        f = v.get("files") or {}
+        return [str((x or {}).get("label", "")) for x in (f.values() if isinstance(f, dict) else f) if x]
+    return {
+        "total": len(items),
+        "empty": [k for k, v in items.items() if not v.get("files")],
+        "no_poster": [k for k in items if k not in poster_keys],
+        "dups": [g for g in groups.values() if len(g) > 1],
+        "watch": [k for k, v in items.items() if any(l == "Watch" or not l for l in labels(v))],
+        "missing_idx": [k for k in items if k not in idx_keys],
+        "orphan_idx": [k for k in idx_keys if k not in items],
+        "orphan_posters": [k for k in poster_keys if k not in items],
+    }
+
+async def on_check(update, context):
+    # /check -> jaanch report.   /check fix -> bina card wale posters/index hata do aur index ki kami poori karo
+    if not await admin_ok(update):
+        return
+    fix = bool(context.args and context.args[0].lower() == "fix")
+    await update.message.reply_text("Jaanch kar raha hu (movies ek baar poori padhni padegi)...")
+
+    def work():
+        items = _items_of(db.reference("movies").get())
+        r = _check_data(items, set(_keys("index")), set(_keys("posters")))
+        fixed = ""
+        if fix:
+            for node, ids in (("posters", r["orphan_posters"]), ("index", r["orphan_idx"])):
+                for i in range(0, len(ids), 300):
+                    db.reference(node).update({k: None for k in ids[i:i + 300]})
+            for k in r["missing_idx"]:
+                index_set(k, items[k])
+            fixed = f"\n\nTheek kiya: {len(r['orphan_posters'])} bina-card poster, {len(r['orphan_idx'])} bina-card index entry hata di, {len(r['missing_idx'])} index entry jod di."
+            if r["orphan_posters"] or r["orphan_idx"] or r["missing_idx"]:
+                touch_meta()
+        return items, r, fixed
+
+    items, r, fixed = await asyncio.to_thread(work)
+    out = [f"Kul cards: {r['total']}"]
+    out.append(f"\nKhali (ek bhi file nahi): {len(r['empty'])}" + (("\n" + _short(items, r["empty"])) if r["empty"] else ""))
+    out.append(f"\nPoster nahi: {len(r['no_poster'])}" + (("\n" + _short(items, r["no_poster"])) if r["no_poster"] else ""))
+    dups = r["dups"]
+    out.append(f"\nEk hi naam+season+saal ke dohre cards: {len(dups)} jodi" + ("".join(f"\n{' + '.join(g[:4])}  ({(items[g[0]].get('title', ''))[:40]})" for g in dups[:6]) if dups else ""))
+    out.append(f"\nJinki koi file ka label 'Watch' (quality nahi): {len(r['watch'])}" + (("\n" + _short(items, r["watch"], 6)) if r["watch"] else ""))
+    out.append(f"\nIndex mein nahi (website par nahi dikhenge): {len(r['missing_idx'])} | Bina card ke index: {len(r['orphan_idx'])} | Bina card ke poster: {len(r['orphan_posters'])}")
+    if not fix and (r["missing_idx"] or r["orphan_idx"] or r["orphan_posters"]):
+        out.append("\n/check fix se ye teen theek ho jayenge (sirf bina-card wali cheezein hatati hai).")
+    if r["empty"] or dups:
+        out.append("Khali ya dohre cards ke liye /remove ID, ya /merge.")
+    text = "\n".join(out) + fixed
+    await update.message.reply_text(text[:3900])
+
+async def on_stats(update, context):
+    if not await admin_ok(update):
+        return
+    await update.message.reply_text(build_report())
+
 async def on_rebuildindex(update, context):
     # /rebuildindex -> purani saari movies ka halka index ek baar mein banao (naya app chalane se pehle ek baar)
     if not await admin_ok(update):
@@ -1464,9 +1845,7 @@ async def on_rebuildindex(update, context):
     idx = {}
     for k, v in items:
         if v and v.get("title"):
-            idx[str(k)] = {"title": v.get("title", ""), "quality": v.get("quality", ""), "date": v.get("date", "")}
-            if v.get("pin"):
-                idx[str(k)]["pin"] = v["pin"]
+            idx[str(k)] = index_entry(k, v, lookup=False)
     db.reference("index").set(idx)
     touch_meta()
     await update.message.reply_text(f"Index ban gaya: {len(idx)} movies. Ab nayi site chalu kar sakte ho.")
@@ -1711,6 +2090,8 @@ async def post_init(application):
     except Exception as e:
         print("Timer padh nahi paya:", type(e).__name__)
     asyncio.create_task(delete_sweeper(application.bot))      # AUTO_DELETE_MIN wali files ka timer
+    asyncio.create_task(notify_sweeper(application.bot))      # nayi file ki soochna
+    asyncio.create_task(stats_loop(application.bot))          # roz ki report
     # Telegram ke "/" menu mein commands dikhao: sab ko sirf /start, admin ko poori list
     try:
         await application.bot.set_my_commands([BotCommand("start", "Bot shuru karo")])
@@ -1731,6 +2112,11 @@ async def post_init(application):
                 BotCommand("unpin", "Pin hatao"),
                 BotCommand("pins", "Pin ki hui movies ki list"),
                 BotCommand("rebuildindex", "App ka index dobara banao"),
+                BotCommand("stats", "Aaj ki report (cards, files, reports)"),
+                BotCommand("find", "Movie dhundo: ID, link, files ginti"),
+                BotCommand("title", "Card ka naam badlo"),
+                BotCommand("backup", "Data ki backup zip file chat mein"),
+                BotCommand("check", "Cards ki jaanch report (khali, dohre, poster nahi)"),
                 BotCommand("usage", "Firebase mein kaun kitni jagah gher raha hai"),
                 BotCommand("relink", "Channel ka username badla: app ke links naye par karo"),
                 BotCommand("timer", "Bheji gayi files kitne minute baad delete hon"),
@@ -1822,6 +2208,11 @@ app.add_handler(CommandHandler("remove", on_remove))
 app.add_handler(CommandHandler("delete", on_delete))
 app.add_handler(CommandHandler("merge", on_merge))
 app.add_handler(CommandHandler("rebuildindex", on_rebuildindex))
+app.add_handler(CommandHandler("stats", on_stats))
+app.add_handler(CommandHandler("find", on_find))
+app.add_handler(CommandHandler("title", on_title))
+app.add_handler(CommandHandler("backup", on_backup))
+app.add_handler(CommandHandler("check", on_check))
 app.add_handler(CommandHandler("usage", on_usage))
 app.add_handler(CommandHandler("relink", on_relink))
 app.add_handler(CommandHandler("timer", on_timer))
