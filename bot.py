@@ -25,18 +25,29 @@ FIELDS = {"movie name": "name", "series name": "name", "release year": "year",
           "released year": "year", "language": "language", "quality": "quality",
           "format": "format", "season": "season", "episode": "episode",
           "year": "year", "released": "year", "languages": "language", "audio": "language",
-          "pixels": "quality", "pixel": "quality", "resolution": "quality", "first aired": "year", "release date": "year", "released on": "year", "release": "year", "aired": "year", "genres": "genre", "genre": "genre", "type": "type", "status": "status"}
+          "pixels": "quality", "pixel": "quality", "resolution": "quality", "first aired": "year", "rating": "rating", "ratings": "rating", "imdb": "rating", "country": "country", "duration": "duration", "runtime": "duration", "release date": "year", "released on": "year", "release": "year", "aired": "year", "genres": "genre", "genre": "genre", "type": "type", "status": "status"}
 
 LINE_KV = re.compile(r"^\W*([A-Za-z][A-Za-z /&]{1,28}?)\s*(?:[:\u00f7=~\u27a4\u00bb\u2192]|[-\u2013\u2014]|[^\w\s]{1,3})\s*(.+)$")
 
+SMALLCAPS = str.maketrans({"\u1d00": "a", "\u0299": "b", "\u1d04": "c", "\u1d05": "d", "\u1d07": "e", "\ua730": "f", "\u0262": "g",
+                           "\u029c": "h", "\u026a": "i", "\u1d0a": "j", "\u1d0b": "k", "\u029f": "l", "\u1d0d": "m", "\u0274": "n",
+                           "\u1d0f": "o", "\u1d18": "p", "\u01eb": "q", "\u0280": "r", "\ua731": "s", "\u1d1b": "t", "\u1d1c": "u",
+                           "\u1d20": "v", "\u1d21": "w", "\u028f": "y", "\u1d22": "z"})        # "T\u026a\u1d1b\u029f\u1d07" jaise chhote capital akshar
+
 def clean_text(text):
     """Styled/fullwidth akshar (\U0001d5e6\U0001d5d8 \uff1a) ko saaf ASCII banao aur chhupe (zero-width) akshar hatao, taaki Key: value pehchani jaye."""
-    t = unicodedata.normalize("NFKC", text or "")
+    t = unicodedata.normalize("NFKC", text or "").translate(SMALLCAPS)
     return re.sub(r"[\u200b-\u200f\u202a-\u202e\u2060\ufeff]", "", t)
 
+NAME_STRONG = re.compile(r"(file |full |movie |series |film |drama |show |serial |anime )?(name|title)")
+NAME_WEAK = {"drama", "movie", "series", "show", "film", "anime", "serial", "kdrama", "k-drama", "cdrama", "web series", "tv series", "tv show"}
+AKA_RE = re.compile(r"\s+(?:aka|a\.k\.a\.?|also known as)\s*[:\-\u2013]?\s*(.+)$", re.I)
+
 def parse_details(text):
-    """Caption ki 'Key: value' lines padho. Separator : ya ÷ ya - ya ~ chalega; shuru ke emoji/symbol hat jate hain."""
+    """Caption ki 'Key: value' lines padho. Separator : ya ÷ ya - ya ~ chalega; shuru ke emoji/symbol hat jate hain.
+    Naam: 'Title/Name/Movie Name/Series Name' (pakka) ya 'Drama:/Movie:/Series:' (kamzor, pakka naam mile to wo jeetega). 'AKA ...' doosra naam alias ban jata hai."""
     out = {}
+    strong = False
     for line in clean_text(text).splitlines():
         m = LINE_KV.match(line.strip())
         if not m:
@@ -45,14 +56,46 @@ def parse_details(text):
         raw = m.group(2).strip()
         v = re.sub(r"\s*#\w+", "", raw).strip(" |")          # #Official jaise tag hatao
         if not v:
+            v = raw.replace("#", "").strip(" |")                # sirf hashtag ho (jaise Language: #Korean) to '#' hatakar rakho
+        if not v:
             continue
         if k in FIELDS:
             out[FIELDS[k]] = v
-        elif k in ("also", "also includes", "includes", "alias", "also known as"):
-            out["alias"] = [x.strip() for x in re.split(r"[,/|]", raw) if x.strip()]    # Also: Jannat 2, Jannat 3
-        elif re.fullmatch(r"(file |full |movie |series |film |drama |show |serial |anime )?(name|title)", k):
-            out["name"] = raw.strip(" |")      # File Name / Full Name / Name / Title / Drama Name ...
+        elif k in ("aka", "a.k.a", "also known as", "alternate title", "other name", "other names"):
+            out["alias"] = list(out.get("alias") or []) + [x.strip() for x in re.split(r"[,/|]", v) if x.strip()]
+        elif k in ("also", "also includes", "includes", "alias"):
+            out["alias"] = list(out.get("alias") or []) + [x.strip() for x in re.split(r"[,/|]", raw) if x.strip()]    # Also: Jannat 2, Jannat 3
+        elif NAME_STRONG.fullmatch(k) or (k in NAME_WEAK and not strong and "name" not in out):
+            if NAME_STRONG.fullmatch(k):
+                strong = True
+            nm = raw.strip(" |")
+            am = AKA_RE.search(nm)
+            if am:                                              # "Cinderella at 2 AM AKA: Sae-byeok ..." -> naam + alias
+                out["alias"] = list(out.get("alias") or []) + [x.strip() for x in re.split(r"[,/|]", am.group(1)) if x.strip()]
+                nm = nm[:am.start()].strip(" |")
+            nm = re.sub(r"\s*#\w+", "", nm).strip(" |-~")
+            nm = re.sub(r"[^\w\)\]!?.\"']+$", "", nm).strip()          # aakhir ke emoji/symbol hatao
+            if nm:
+                out["name"] = nm
     return out
+
+def fallback_name(text, d):
+    """Koi 'Name/Title' nahi mila par post poster jaisi hai (kam se kam 2 details): pehli line se naam ka andaza lagao."""
+    if sum(1 for k in ("year", "genre", "language", "quality", "season", "episode", "status", "type", "rating", "country", "duration") if k in d) < 2:
+        return None
+    for l in [x.strip() for x in clean_text(text).splitlines() if x.strip()][:3]:
+        body = re.sub(r"^[\W_]+", "", l)
+        if ":" in body:
+            left, right = body.split(":", 1)
+            body = right if len(left.strip()) <= 16 and right.strip() else body
+        body = re.sub(r"\s*#\w+", "", body)
+        am = AKA_RE.search(body)
+        if am:
+            body = body[:am.start()]
+        body = re.sub(r"[^\w\)\]!?.\"']+$", "", body.strip(" |-~*_"))
+        if len(body) >= 2 and re.search(r"[A-Za-z0-9]", body):
+            return body.title() if body.isupper() else body
+    return None
 
 def guess_name(text, d, has_buttons):
     """Caption mein 'Name:' nahi: pehli line (emoji hata kar) ko naam maano, par tabhi jab post movie-post jaisi ho
@@ -71,7 +114,7 @@ def guess_name(text, d, has_buttons):
         return None
     if name.isupper():
         name = name.title()           # VOICEMAILS FOR ISABELLE -> Voicemails For Isabelle
-    looks_like_post = has_buttons or any(k in d for k in ("language", "format", "quality", "year", "season", "episode", "genre", "type"))
+    looks_like_post = has_buttons or any(k in d for k in ("language", "format", "quality", "year", "season", "episode", "genre", "type", "rating", "country"))
     return name if looks_like_post else None
 
 LANG_WORDS = ["Hindi", "English", "Korean", "Chinese", "Japanese", "Tamil", "Telugu", "Malayalam", "Kannada", "Bengali",
@@ -630,6 +673,7 @@ async def on_channel_post(update, context):
                         g = g.replace(ms_.group(0), " ")
                 g = re.sub(r"\s+", " ", g).strip(" -~|*_")
                 d["name"] = g or d.get("name", "")
+        guessed = False
         lfiles = []                      # quality ke saamne download link wale poster (files channel mein nahi)
         if "name" not in d:
             lp = parse_link_post(msg.caption, msg.caption_entities)
@@ -643,6 +687,11 @@ async def on_channel_post(update, context):
                 if lp["files"]:
                     d["quality"] = " | ".join(dict.fromkeys(q for q, _, _ in lp["files"]))
                 lfiles = lp["files"]
+        if "name" not in d:
+            fb = fallback_name(msg.caption, d)
+            if fb:
+                d["name"] = fb
+                guessed = True
         ym = re.search(r"(?:19|20)\d{2}", d.get("year", "") or "")      # "2022-9-9" -> "2022"
         if ym:
             d["year"] = ym.group(0)
@@ -762,6 +811,8 @@ async def on_channel_post(update, context):
             print("Saved:", title, "| buttons:", len(btns), "| merge:", mg if mg else "-")
             LAST = ("created", title)
             bump("cards")
+            if guessed:
+                await tell_admin(context.bot, f"Card ban gayi par naam andaze se liya: {title}\n{base}{msg.message_id}\nGalat ho to: /title {msg.message_id} Sahi Naam")
             return
 
     # Header post: sticker / animation / bina details wali photo (jaise "1080P", "SEASON 02")
