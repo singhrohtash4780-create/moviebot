@@ -198,8 +198,9 @@ def parse_link_post(text, entities=None):
     for l in lines:
         if l.lower().startswith("join") or "@" in l or re.search(r"https?://", l):
             continue
-        for w in LANG_WORDS:
-            if re.search(r"\b" + w + r"\b", l, re.I) and w not in seen:
+        hits = sorted((m_.start(), w) for w in LANG_WORDS for m_ in [re.search(r"\b" + w + r"\b", l, re.I)] if m_)
+        for _, w in hits:                      # jis order mein caption mein likha hai
+            if w not in seen:
                 seen.add(w)
                 langs.append(w)
     return {"name": name, "season": season, "year": year, "language": " + ".join(langs), "files": items}
@@ -331,9 +332,14 @@ def same_name(a, b):
 def alias_hit(k, aliases):
     return any(k == a or k.startswith(a + " ") or same_name(k, a) for a in aliases)
 
-def merge_autos(force=False):
+def merge_autos(force=False, new_id=None, new_alias=False):
     """Bina-poster wale card ki files, usi naam ke poster wale card mein daalo aur khali card hata do."""
-    # Firebase se poori 'movies' list padhna bhaari hai (download badhta hai): jab koi bina-poster card hai hi nahi to dobara mat padho
+    # Firebase se poori 'movies' list padhna bhaari hai (download badhta hai). Naya poster aaye to pehle yaad (memory) mein dekho:
+    # koi bina-poster card uske naam se milta hi nahi (aur naye poster par alias bhi nahi) to Firebase ko chhoona hi nahi
+    if not force and new_id is not None and NAMES is not None and not new_alias:
+        nk = NAMES.get(new_id)
+        if not nk or not any(i in AUTO and NAMES.get(i) and same_name(NAMES[i][0], nk[0]) for i in AUTO):
+            return 0
     if NAMES is None or force or AUTO:
         load_names()
     if not AUTO:
@@ -509,7 +515,7 @@ def index_set(cid, card):
     db.reference(f"index/{cid}").set(index_entry(cid, card))
 
 # meta/updated badalte hi website ka poora cache naya ban jata hai (Firebase se phir download): isliye kai badlav ek saath ek hi baar mein likho
-META_MIN_GAP = int(os.environ.get("META_MIN_GAP", "45") or 45)       # seconds: itne mein ek hi baar badlo (kam = jaldi dikhe, zyada = Firebase download kam)
+META_MIN_GAP = int(os.environ.get("META_MIN_GAP", "60") or 60)       # seconds: itne mein ek hi baar badlo (kam = jaldi dikhe, zyada = Firebase download kam)
 _meta_last = 0.0
 _meta_timer = None
 _meta_lock = threading.Lock()
@@ -807,7 +813,7 @@ async def on_channel_post(update, context):
             NAMES[msg.message_id] = (title_key(title), dseason)
             YEARS[msg.message_id] = str(d.get("year", "") or "")
             touch_meta()
-            mg = merge_autos()           # pehle aayi bina-poster files ab is card mein aa jayein
+            mg = merge_autos(new_id=msg.message_id, new_alias=bool(d.get("alias")))      # pehle aayi bina-poster files ab is card mein aa jayein
             print("Saved:", title, "| buttons:", len(btns), "| merge:", mg if mg else "-")
             LAST = ("created", title)
             bump("cards")
@@ -1154,6 +1160,19 @@ async def safe_copy(bot, chat_id, user, num, caption=None):
             return False
     return False
 
+_CARD_CACHE = {}      # mid -> (waqt, card): kai log ek hi series maange to Firebase se baar-baar poora card na padhna pade
+
+def card_cached(mid, ttl=120):
+    now = time.time()
+    hit = _CARD_CACHE.get(mid)
+    if hit and now - hit[0] < ttl:
+        return hit[1]
+    card = db.reference(f"movies/{mid}").get() or {}
+    if len(_CARD_CACHE) > 300:
+        _CARD_CACHE.clear()
+    _CARD_CACHE[mid] = (now, card)
+    return card
+
 async def on_start(update, context):
     # App ka quality button: https://t.me/<bot>?start=<movie_id>-<season>-<quality>
     if not context.args:
@@ -1171,7 +1190,7 @@ async def on_start(update, context):
     except ValueError:
         await update.message.reply_text("Ye link sahi nahi hai.")
         return
-    m = db.reference(f"movies/{mid}").get() or {}
+    m = card_cached(mid)
     files = [f for f in (m.get("files") or {}).values()
              if (f.get("season", 0) or 0) == season
              and q.lower() in str(f.get("label", "")).lower()
@@ -1360,7 +1379,7 @@ async def on_help(update, context):
         "/unpin POST_LINK ya naam - pin hatao\n"
         "/pins - pin ki hui movies ki list\n"
         "Manual add: channel ki poster ya file wali post bot ki private chat mein FORWARD karo, bot use app mein jod dega\n"
-        "/usage - Firebase mein kaunsi cheez kitni jagah gher rahi hai\n"
+        "/usage - Firebase mein kaunsi cheez kitni jagah gher rahi hai (jaldi andaza, ~3 MB); /usage full = exact (~30 MB)\n"
         "/timer 10 - bot ki bheji hui files 10 minute baad apne aap delete (band: /timer off)\n"
         "/relink purana naya - channel ka username badla ho to app ke saare links naye username par karo\n"
         "/postertest - ek poster ko 4 size par dikhao (KB ke saath), phir sahi size chuno\n"
@@ -1554,22 +1573,37 @@ async def on_forwarded(update, context):
         await m.reply_text("Bot ne is post par koi kaam nahi kiya. Poster (photo + caption) ya file wali post forward karo.")
 
 async def on_usage(update, context):
-    # /usage -> Firebase mein kaunsi cheez kitni jagah gher rahi hai (ek baar poora padhta hai, ~storage jitna download)
+    # /usage       -> jaldi aur sasta andaza (posters ke ~25 sample padhta hai, ~3 MB download)
+    # /usage full  -> exact naap (poori Firebase padhta hai, ~30 MB download: roz mat chalao)
     if not await admin_ok(update):
         return
-    await update.message.reply_text("Naap raha hu (ek baar poora data padhna padega, thoda ruko)...")
-    rows, total = [], 0
-    for node in ("movies", "posters", "index", "heads", "backup", "meta", "config"):
-        try:
-            data = db.reference(node).get()
-        except Exception as e:
-            rows.append(f"{node}: padh nahi paya ({type(e).__name__})")
-            continue
-        size = len(json.dumps(data or {}, ensure_ascii=False).encode("utf-8"))
-        n = len(data) if isinstance(data, (dict, list)) else 0
-        total += size
-        avg = f", har ek ~{size / n / 1024:.1f} KB" if n else ""
-        rows.append(f"{node}: {size / 1024 / 1024:.2f} MB ({n} cheez{avg})")
+    full = bool(context.args and context.args[0].lower() == "full")
+    await update.message.reply_text("Naap raha hu" + (" (exact, ~30 MB download)" if full else "") + "...")
+
+    def work():
+        rows, total = [], 0.0
+        for node in ("movies", "posters", "index", "heads", "backup", "meta", "config"):
+            try:
+                if node == "posters" and not full:
+                    keys = _keys("posters")
+                    import random as _r
+                    pick = _r.sample(keys, min(25, len(keys)))
+                    vals = [db.reference(f"posters/{k}").get() for k in pick]
+                    avg = sum(len(v) for v in vals if isinstance(v, str)) / max(1, len(pick))
+                    size, n, tag = avg * len(keys), len(keys), " (andaza, 25 sample se)"
+                else:
+                    data = db.reference(node).get()
+                    size = len(json.dumps(data or {}, ensure_ascii=False).encode("utf-8"))
+                    n, tag = (len(data) if isinstance(data, (dict, list)) else 0), ""
+            except Exception as e:
+                rows.append(f"{node}: padh nahi paya ({type(e).__name__})")
+                continue
+            total += size
+            avg_s = f", har ek ~{size / n / 1024:.1f} KB" if n else ""
+            rows.append(f"{node}: {size / 1024 / 1024:.2f} MB ({n} cheez{avg_s}){tag}")
+        return rows, total
+
+    rows, total = await asyncio.to_thread(work)
     await update.message.reply_text("Firebase ka hisaab:\n" + "\n".join(rows) + f"\nKul: {total / 1024 / 1024:.2f} MB")
 
 SHRINKING = False
@@ -1580,10 +1614,7 @@ async def on_postertest(update, context):
     # /postertest [post_id] -> ek poster ko alag-alag size/quality par bana kar dikhao (KB ke saath), taaki dekh kar chuno
     if not await admin_ok(update):
         return
-    try:
-        keys = list(((await asyncio.to_thread(lambda: db.reference("posters").get(shallow=True))) or {}).keys())
-    except TypeError:
-        keys = list(((await asyncio.to_thread(lambda: db.reference("posters").get())) or {}).keys())
+    keys = await asyncio.to_thread(_keys, "posters")
     if not keys:
         await update.message.reply_text("Koi poster nahi mila.")
         return
@@ -1643,10 +1674,7 @@ async def on_shrinkposters(update, context):
     SHRINKING = True
     try:
         await update.message.reply_text("Shuru kar raha hu, kuch minute lagenge. Khatam hone par batata hu.")
-        try:
-            keys = list(((await asyncio.to_thread(lambda: db.reference("posters").get(shallow=True))) or {}).keys())
-        except TypeError:
-            keys = list(((await asyncio.to_thread(lambda: db.reference("posters").get())) or {}).keys())
+        keys = await asyncio.to_thread(_keys, "posters")
         done = skipped = bad = saved = 0
         for k in keys:
             try:
@@ -1724,11 +1752,13 @@ async def on_timer(update, context):
                                     f"Ab bot ki bheji hui files {mins} minute baad apne aap delete ho jayengi (nayi files par; jo pehle bheji gayi unka purana timer chalega).")
 
 def _keys(path):
-    """Ek node ki sirf keys (poora data nahi): shallow chale to wahi, warna poora padho."""
+    """Ek node ki sirf keys (poora data nahi). Shallow na chale to bhaari node (posters) ki jagah index ki keys lo, taaki 27 MB na padhna pade."""
     ref = db.reference(path)
     try:
         d = ref.get(shallow=True)
     except TypeError:
+        if path == "posters":
+            return _keys("index")              # har card ka poster hota hai: lagbhag wahi IDs
         d = ref.get()
     return list(d.keys()) if isinstance(d, dict) else []
 
@@ -2210,7 +2240,7 @@ threading.Thread(target=serve, daemon=True).start()
 # Wo band ho jaye (CMD band, phone off) to ~1 minute mein agla taiyaar bot lock le leta hai.
 ME = uuid.uuid4().hex[:8]
 WHERE = os.environ.get("BOT_WHERE") or ("render" if os.environ.get("RENDER") else socket.gethostname())
-LEASE_MS = 60000
+LEASE_MS = 120000
 
 def try_lock():
     now = int(time.time() * 1000)
@@ -2218,9 +2248,7 @@ def try_lock():
         if cur is None or cur.get("id") == ME or now - cur.get("ts", 0) > LEASE_MS:
             return {"id": ME, "ts": now, "where": WHERE}
         return cur
-    ref = db.reference("lock/leader")
-    ref.transaction(fn)
-    cur = ref.get() or {}
+    cur = db.reference("lock/leader").transaction(fn) or {}      # nateeja seedha milta hai: alag get ki zaroorat nahi (Firebase calls kam)
     return cur.get("id") == ME, cur
 
 def release_lock():
@@ -2231,7 +2259,7 @@ def release_lock():
 
 def heartbeat():
     while True:
-        time.sleep(20)
+        time.sleep(40)
         try:
             ok, cur = try_lock()
             if not ok:
@@ -2245,7 +2273,7 @@ while True:
     if ok:
         break
     print(f"Doosra bot ('{cur.get('where')}') abhi active hai. Main intezaar kar raha hu...")
-    time.sleep(15)
+    time.sleep(30)
 print("Main active bot hu:", WHERE)
 threading.Thread(target=heartbeat, daemon=True).start()
 
